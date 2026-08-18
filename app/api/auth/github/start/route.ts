@@ -2,12 +2,12 @@ import { getAuthConfig } from "@/src/server/config";
 import { AuthRepository } from "@/src/server/auth/repository";
 import { buildGitHubAuthorizationUrl } from "@/src/server/auth/github";
 import {
-  OAUTH_TRANSACTION_KEY_VERSION,
   oauthEncryptionKey,
   oauthVerifierAad,
 } from "@/src/server/auth/oauth-transaction";
 import { authCookieContext } from "@/src/server/auth/session";
 import { redirectNoStore, jsonNoStore } from "@/src/server/http";
+import { MailConnectionRepository } from "@/src/server/mail/connection-repository";
 import { serializeOAuthCookie } from "@/src/server/security/cookies";
 import {
   createPkcePair,
@@ -19,6 +19,7 @@ import {
   requireSafeReturnPath,
   validateSameOriginMutation,
 } from "@/src/server/security/request-security";
+import { consumeRequestRateLimit } from "@/src/server/security/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -104,6 +105,27 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   try {
+    const rateLimitRepository = new MailConnectionRepository({
+      databaseUrl: config.databaseUrl,
+    });
+    const rateLimit = await consumeRequestRateLimit({
+      action: "github_sign_in_start",
+      config,
+      maximum: 10,
+      repository: rateLimitRepository,
+      request,
+      windowSeconds: 10 * 60,
+    });
+    if (!rateLimit.allowed) {
+      return jsonNoStore(
+        { error: "rate_limited" },
+        {
+          status: 429,
+          headers: { "Retry-After": String(rateLimit.retryAfterSeconds) },
+        },
+      );
+    }
+
     const repository = new AuthRepository({ databaseUrl: config.databaseUrl });
     const transactionId = crypto.randomUUID();
     const state = randomBase64Url(32);
@@ -113,8 +135,12 @@ export async function POST(request: Request): Promise<Response> {
     const codeVerifierEnvelope = await encryptAes256Gcm(
       key,
       pkce.verifier,
-      oauthVerifierAad(transactionId),
-      OAUTH_TRANSACTION_KEY_VERSION,
+      oauthVerifierAad(
+        transactionId,
+        "github",
+        config.tokenEncryptionKeyVersion,
+      ),
+      config.tokenEncryptionKeyVersion,
     );
 
     await repository.createOAuthTransaction({

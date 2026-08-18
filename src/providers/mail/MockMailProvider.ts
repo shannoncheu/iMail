@@ -41,6 +41,7 @@ const previewFromBody = (body: string) => {
 export class MockMailProvider implements MailProvider {
   private threads = clone(mockThreads);
   private previousFolders = new Map<string, MailThread["folder"]>();
+  private draftSnapshots = new Map<string, MailDraft>();
   private sequence = 0;
 
   async getAccounts() {
@@ -48,10 +49,18 @@ export class MockMailProvider implements MailProvider {
     return clone(mockAccounts);
   }
 
-  async getFolders(scope: "all" | ProviderSource): Promise<MailFolder[]> {
+  async getFolders(
+    scope: "all" | ProviderSource,
+    accountId?: string,
+  ): Promise<MailFolder[]> {
     await wait(70);
+    if (scope === "all" && accountId !== undefined) {
+      throw new TypeError("An account filter requires a provider scope");
+    }
     const scopedThreads = this.threads.filter(
-      (thread) => scope === "all" || thread.provider === scope,
+      (thread) =>
+        (scope === "all" || thread.provider === scope) &&
+        (!accountId || thread.accountId === accountId),
     );
 
     return clone(
@@ -72,12 +81,17 @@ export class MockMailProvider implements MailProvider {
 
   async getMessages(query: MessageQuery): Promise<MailThread[]> {
     await wait(180);
+    if (query.scope === "all" && query.accountId !== undefined) {
+      throw new TypeError("An account filter requires a provider scope");
+    }
     const term = query.search?.trim().toLocaleLowerCase();
 
     return clone(
       this.threads.filter((thread) => {
         const scopeMatches =
           query.scope === "all" || thread.provider === query.scope;
+        const accountMatches =
+          !query.accountId || thread.accountId === query.accountId;
         const folderMatches =
           query.folder === "starred"
             ? thread.starred
@@ -88,7 +102,7 @@ export class MockMailProvider implements MailProvider {
           thread.subject.toLocaleLowerCase().includes(term) ||
           thread.preview.toLocaleLowerCase().includes(term);
 
-        return scopeMatches && folderMatches && termMatches;
+        return scopeMatches && accountMatches && folderMatches && termMatches;
       }),
     );
   }
@@ -112,6 +126,7 @@ export class MockMailProvider implements MailProvider {
       ),
     ];
     if (draft.id) this.previousFolders.delete(draft.id);
+    if (draft.id) this.draftSnapshots.delete(draft.id);
 
     return { id };
   }
@@ -144,8 +159,14 @@ export class MockMailProvider implements MailProvider {
     } else {
       this.threads = [savedDraft, ...this.threads];
     }
+    this.draftSnapshots.set(id, clone({ ...draft, id }));
 
     return { id, savedAt: timestamp.short };
+  }
+
+  async getDraft(id: string): Promise<MailDraft | null> {
+    await wait(90);
+    return clone(this.draftSnapshots.get(id) ?? null);
   }
 
   async replyMessage(id: string, draft: MailDraft) {
@@ -162,6 +183,7 @@ export class MockMailProvider implements MailProvider {
       preview: previewFromBody(draft.body),
       receivedAt: timestamp.short,
       receivedAtFull: timestamp.full,
+      receivedAtMs: timestamp.atMs,
       unread: false,
       messages: [...current.messages, reply],
     };
@@ -172,6 +194,7 @@ export class MockMailProvider implements MailProvider {
           !draft.id || thread.id !== draft.id || thread.folder !== "drafts",
       );
     if (draft.id) this.previousFolders.delete(draft.id);
+    if (draft.id) this.draftSnapshots.delete(draft.id);
 
     return { id: reply.id };
   }
@@ -275,7 +298,7 @@ export class MockMailProvider implements MailProvider {
     draft: MailDraft,
     id: string,
     folder: "sent" | "drafts",
-    timestamp: { short: string; full: string },
+    timestamp: { short: string; full: string; atMs: number },
   ): MailThread {
     const account = this.accountFor(draft.accountId);
     const message = this.outgoingMessage(draft, folder, timestamp);
@@ -293,6 +316,7 @@ export class MockMailProvider implements MailProvider {
         folder === "drafts"
           ? `Draft saved ${timestamp.full}`
           : timestamp.full,
+      receivedAtMs: timestamp.atMs,
       unread: false,
       starred: false,
       labels: folder === "drafts" ? ["Draft"] : [],
@@ -304,7 +328,7 @@ export class MockMailProvider implements MailProvider {
   private outgoingMessage(
     draft: MailDraft,
     prefix: string,
-    timestamp: { short: string; full: string },
+    timestamp: { short: string; full: string; atMs: number },
   ): ThreadMessage {
     const account = this.accountFor(draft.accountId);
     const recipients = [...draft.to, ...draft.cc, ...draft.bcc].map(
@@ -339,6 +363,7 @@ export class MockMailProvider implements MailProvider {
         dateStyle: "long",
         timeStyle: "short",
       }).format(now),
+      atMs: now.getTime(),
     };
   }
 

@@ -1,7 +1,9 @@
 export const SESSION_COOKIE_NAME = "__Host-imail-session";
 export const OAUTH_COOKIE_NAME = "__Host-imail-oauth";
+export const MAIL_OAUTH_COOKIE_NAME = "__Host-imail-mail-oauth";
 export const LOCAL_SESSION_COOKIE_NAME = "imail-session";
 export const LOCAL_OAUTH_COOKIE_NAME = "imail-oauth";
+export const LOCAL_MAIL_OAUTH_COOKIE_NAME = "imail-mail-oauth";
 
 const DEFAULT_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
 const DEFAULT_OAUTH_MAX_AGE_SECONDS = 10 * 60;
@@ -13,6 +15,7 @@ export interface AuthCookieContext {
 }
 
 export interface AuthCookiePolicy {
+  mailOAuthCookieName: string;
   oauthCookieName: string;
   secure: boolean;
   sessionCookieName: string;
@@ -104,12 +107,14 @@ export function resolveAuthCookiePolicy(context: AuthCookieContext): AuthCookieP
   }
 
   return secure
-    ? {
+      ? {
+        mailOAuthCookieName: MAIL_OAUTH_COOKIE_NAME,
         oauthCookieName: OAUTH_COOKIE_NAME,
         secure: true,
         sessionCookieName: SESSION_COOKIE_NAME,
       }
-    : {
+      : {
+        mailOAuthCookieName: LOCAL_MAIL_OAUTH_COOKIE_NAME,
         oauthCookieName: LOCAL_OAUTH_COOKIE_NAME,
         secure: false,
         sessionCookieName: LOCAL_SESSION_COOKIE_NAME,
@@ -164,6 +169,32 @@ export function clearOAuthCookie(context: AuthCookieContext): string {
   return serializeExpiredCookie(policy.oauthCookieName, "Lax", policy.secure);
 }
 
+export function serializeMailOAuthCookie(
+  value: string,
+  context: AuthCookieContext,
+  maxAgeSeconds = DEFAULT_OAUTH_MAX_AGE_SECONDS,
+): string {
+  assertCookieValue(value);
+  assertMaxAge(maxAgeSeconds);
+  const policy = resolveAuthCookiePolicy(context);
+  return serializeCookie(
+    policy.mailOAuthCookieName,
+    value,
+    "Lax",
+    policy.secure,
+    maxAgeSeconds,
+  );
+}
+
+export function clearMailOAuthCookie(context: AuthCookieContext): string {
+  const policy = resolveAuthCookiePolicy(context);
+  return serializeExpiredCookie(
+    policy.mailOAuthCookieName,
+    "Lax",
+    policy.secure,
+  );
+}
+
 export function readCookieValue(cookieHeader: string | null, name: string): string | null {
   if (!cookieHeader) {
     return null;
@@ -200,5 +231,17 @@ export function readOAuthCookie(
 ): string | null {
   const { oauthCookieName } = resolveAuthCookiePolicy(context);
   const value = readCookieValue(request.headers.get("cookie"), oauthCookieName);
+  return value && isAuthenticationCookieValue(value) ? value : null;
+}
+
+export function readMailOAuthCookie(
+  request: Request,
+  context: AuthCookieContext,
+): string | null {
+  const { mailOAuthCookieName } = resolveAuthCookiePolicy(context);
+  const value = readCookieValue(
+    request.headers.get("cookie"),
+    mailOAuthCookieName,
+  );
   return value && isAuthenticationCookieValue(value) ? value : null;
 }

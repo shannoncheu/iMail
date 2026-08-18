@@ -10,7 +10,7 @@
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite",
     "build": "bash scripts/build-verified.sh",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
-    "test": "npm run build && node --test --test-concurrency=1 tests/rendered-html.test.mjs tests/mock-mail-provider.test.mjs tests/auth-security.test.mjs tests/auth-flow.test.mjs tests/auth-repository.test.mjs tests/server-provider-boundary.test.mjs",
+    "test": "npm run build && node --test --test-concurrency=1 tests/rendered-html.test.mjs tests/mock-mail-provider.test.mjs tests/auth-security.test.mjs tests/auth-flow.test.mjs tests/auth-repository.test.mjs tests/mail-repository.test.mjs tests/mail-pagination-repository.test.mjs tests/mail-draft-intent-repository.test.mjs tests/server-provider-boundary.test.mjs tests/mail-account-filter.test.mjs tests/mail-aggregate-pagination.test.mjs tests/mail-draft-flow.test.mjs tests/gmail-mail-provider.test.mjs tests/outlook-mail-provider.test.mjs tests/zoho-mail-provider.test.mjs tests/provider-factory.test.mjs tests/api-mail-provider.test.mjs tests/mail-oauth.test.mjs tests/revoke-mail-connection.test.mjs tests/mail-html-sanitizer.test.mjs tests/response-headers.test.mjs tests/http.test.mjs tests/client-mail-integration.test.mjs tests/maintenance.test.mjs tests/token-key-rotation.test.mjs",
     "db:migrate": "node --env-file-if-exists=.dev.vars scripts/migrate.mjs",
     "typecheck": "tsc --noEmit",
     "validate:artifact": "bash scripts/validate-artifact.sh",

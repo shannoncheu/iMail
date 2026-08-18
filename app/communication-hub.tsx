@@ -3,6 +3,7 @@
 import {
   QueryClient,
   QueryClientProvider,
+  useInfiniteQuery,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -12,10 +13,8 @@ import {
   Archive,
   ArrowLeft,
   AtSign,
-  Bold,
   Check,
   CheckCircle2,
-  ChevronDown,
   ChevronRight,
   Clock3,
   Download,
@@ -26,10 +25,7 @@ import {
   Forward,
   ImageOff,
   Inbox,
-  Italic,
-  Link2,
   List,
-  ListOrdered,
   LockKeyhole,
   LogOut,
   Mail,
@@ -37,7 +33,6 @@ import {
   Menu,
   Monitor,
   Moon,
-  MoreHorizontal,
   Paperclip,
   PencilLine,
   RefreshCw,
@@ -48,9 +43,7 @@ import {
   ShieldCheck,
   Star,
   Sun,
-  Tag,
   Trash2,
-  Underline,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -68,6 +61,8 @@ import {
   type MailAttachment,
   type MailDraft,
   type MailFolderId,
+  type MailMessagePage,
+  type MailParticipant,
   type MailProvider,
   type MailThread,
   type MessageLocation,
@@ -80,7 +75,7 @@ type Scope = "all" | ProviderSource;
 type ThemeMode = "light" | "dark" | "system";
 type Density = "compact" | "comfortable" | "relaxed";
 type AppView = "mail" | "settings";
-type ComposeMode = "new" | "reply" | "forward";
+type ComposeMode = "new" | "reply" | "forward" | "draft";
 
 interface ToastState {
   message: string;
@@ -122,6 +117,26 @@ const providerColors: Record<ProviderSource, string> = {
   zoho: "#c68a35",
 };
 
+function initialMailConnectionToast(): ToastState | null {
+  if (typeof window === "undefined") return null;
+  const url = new URL(window.location.href);
+  const connectedProvider = url.searchParams.get("mail_connected");
+  if (
+    connectedProvider === "gmail" ||
+    connectedProvider === "outlook" ||
+    connectedProvider === "zoho"
+  ) {
+    return { message: `${providerLabels[connectedProvider]} connected` };
+  }
+  return url.searchParams.has("mail_error")
+    ? {
+        message:
+          "The mailbox couldn’t be connected. Check its permissions and try again.",
+        tone: "error",
+      }
+    : null;
+}
+
 function initials(name: string) {
   return name
     .split(" ")
@@ -147,6 +162,8 @@ const monthNumbers: Record<string, string> = {
 };
 
 function toDateTime(value: string) {
+  const parsed = Date.parse(value);
+  if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
   const match = value.match(
     /(?:^|\s)(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s+at\s+(\d{2}:\d{2})/,
   );
@@ -161,6 +178,61 @@ function splitRecipients(value: string) {
     .split(/[;,]/)
     .map((recipient) => recipient.trim())
     .filter(Boolean);
+}
+
+function replyRecipient(thread: MailThread | null, account?: MailAccount): string {
+  const latest = thread?.messages.at(-1);
+  const ownAddress = account?.address.trim().toLowerCase();
+  const candidates = [
+    latest?.sender,
+    ...(latest?.recipients ?? []),
+    thread?.sender,
+  ].filter((participant): participant is MailParticipant => Boolean(participant));
+  return (
+    candidates.find(
+      ({ email }) => !ownAddress || email.trim().toLowerCase() !== ownAddress,
+    ) ?? candidates[0]
+  )?.email ?? "";
+}
+
+function composeIntentFor(
+  mode: ComposeMode,
+  sourceId: string | undefined,
+): MailDraft["composeIntent"] {
+  return (mode === "reply" || mode === "forward") && sourceId
+    ? { mode, sourceId }
+    : undefined;
+}
+
+const MAX_COMPOSE_ATTACHMENTS = 10;
+const MAX_ATTACHMENT_BYTES = 5 * 1_024 * 1_024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 5 * 1_024 * 1_024;
+
+function formatFileSize(sizeBytes: number) {
+  if (sizeBytes < 1_024) return `${sizeBytes} B`;
+  if (sizeBytes < 1_024 * 1_024) return `${Math.ceil(sizeBytes / 1_024)} KB`;
+  const megabytes = sizeBytes / (1_024 * 1_024);
+  return `${megabytes.toFixed(megabytes >= 10 ? 0 : 1)} MB`;
+}
+
+function attachmentKind(file: File): MailAttachment["kind"] {
+  if (file.type.startsWith("image/")) return "image";
+  if (
+    /(?:zip|gzip|x-7z-compressed|x-rar-compressed|x-tar)/iu.test(file.type) ||
+    /\.(?:7z|gz|rar|tar|tgz|zip)$/iu.test(file.name)
+  ) {
+    return "archive";
+  }
+  return "document";
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 0x8000)));
+  }
+  return window.btoa(chunks.join(""));
 }
 
 export default function CommunicationHub({
@@ -181,7 +253,7 @@ export default function CommunicationHub({
         },
       }),
   );
-  const [provider] = useState(() => createMailProvider());
+  const [provider] = useState(() => createMailProvider(csrfToken));
 
   return (
     <QueryClientProvider client={queryClient}>
@@ -203,6 +275,7 @@ function Hub({
   const reduceMotion = useReducedMotion();
   const [view, setView] = useState<AppView>("mail");
   const [scope, setScope] = useState<Scope>("all");
+  const [scopeAccountId, setScopeAccountId] = useState<string>();
   const [folder, setFolder] = useState<MailFolderId>("inbox");
   const [selectedId, setSelectedId] = useState("design-review");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -227,79 +300,239 @@ function Hub({
   const [mobilePane, setMobilePane] = useState<"list" | "reader">("list");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [composeMode, setComposeMode] = useState<ComposeMode | null>(null);
+  const [composeInitialDraft, setComposeInitialDraft] =
+    useState<MailDraft | null>(null);
+  const [loadingDraftId, setLoadingDraftId] = useState<string | null>(null);
   const [settingsSection, setSettingsSection] = useState("general");
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
-  const [toast, setToast] = useState<ToastState | null>(null);
+  const [toast, setToast] = useState<ToastState | null>(
+    initialMailConnectionToast,
+  );
   const [externalImages, setExternalImages] = useState(false);
   const [loadedImageThreadIds, setLoadedImageThreadIds] = useState<Set<string>>(
     new Set(),
   );
   const [pendingMailAction, setPendingMailAction] = useState<string | null>(null);
+  const [pendingConnectionAction, setPendingConnectionAction] = useState<
+    string | null
+  >(null);
   const [signingOut, setSigningOut] = useState(false);
   const mailActionPendingRef = useRef(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const composeButtonRef = useRef<HTMLButtonElement>(null);
   const composeReturnFocusRef = useRef<HTMLElement | null>(null);
   const composeModeRef = useRef<ComposeMode | null>(null);
+  const loadingDraftIdRef = useRef<string | null>(null);
+  const draftLoadGenerationRef = useRef(0);
 
-  const openCompose = useCallback((mode: ComposeMode) => {
-    if (composeModeRef.current) return;
-    const activeElement = document.activeElement;
-    composeReturnFocusRef.current =
-      activeElement instanceof HTMLElement
-        ? activeElement
-        : composeButtonRef.current;
-    composeModeRef.current = mode;
-    setComposeMode(mode);
-  }, []);
+  const openCompose = useCallback(
+    (
+      mode: ComposeMode,
+      initialDraft?: MailDraft,
+      returnFocus?: HTMLElement | null,
+    ) => {
+      if (composeModeRef.current) return;
+      const activeElement = returnFocus ?? document.activeElement;
+      composeReturnFocusRef.current =
+        activeElement instanceof HTMLElement
+          ? activeElement
+          : composeButtonRef.current;
+      composeModeRef.current = mode;
+      setComposeInitialDraft(initialDraft ?? null);
+      setComposeMode(mode);
+    },
+    [],
+  );
 
   const closeCompose = useCallback(() => {
-    composeModeRef.current = null;
     setComposeMode(null);
-    window.setTimeout(() => {
-      const returnTarget = composeReturnFocusRef.current;
-      if (returnTarget?.isConnected) returnTarget.focus();
-      else composeButtonRef.current?.focus();
-    }, 0);
+    setComposeInitialDraft(null);
   }, []);
 
-  useEffect(() => {
-    const timeout = window.setTimeout(
-      () => setDebouncedSearchTerm(searchTerm.trim()),
-      250,
-    );
-    return () => window.clearTimeout(timeout);
-  }, [searchTerm]);
+  const finishComposeExit = useCallback(() => {
+    composeModeRef.current = null;
+    const returnTarget = composeReturnFocusRef.current;
+    if (returnTarget?.isConnected) returnTarget.focus();
+    else composeButtonRef.current?.focus();
+  }, []);
 
   const accountsQuery = useQuery({
     queryKey: ["mail", "accounts"],
     queryFn: () => provider.getAccounts(),
   });
+  const accountLimitFallback =
+    scope === "all" && (accountsQuery.data?.length ?? 0) > 5
+      ? accountsQuery.data?.[0]
+      : undefined;
+  const resolvedScope: Scope = accountLimitFallback?.provider ?? scope;
+  const resolvedScopeAccountId = accountLimitFallback?.id ?? scopeAccountId;
+  const outlookStarredSearchDisabled =
+    folder === "starred" &&
+    resolvedScope === "outlook" &&
+    Boolean(resolvedScopeAccountId);
+
+  useEffect(() => {
+    if (outlookStarredSearchDisabled) return;
+    const timeout = window.setTimeout(
+      () => setDebouncedSearchTerm(searchTerm.trim()),
+      250,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [outlookStarredSearchDisabled, searchTerm]);
+
   const foldersQuery = useQuery({
-    queryKey: ["mail", "folders", scope],
-    queryFn: () => provider.getFolders(scope),
-  });
-  const messagesQuery = useQuery({
-    queryKey: ["mail", "messages", scope, folder, debouncedSearchTerm],
+    queryKey: ["mail", "folders", resolvedScope, resolvedScopeAccountId],
     queryFn: () =>
-      provider.getMessages({
-        scope,
+      provider.getFolders(resolvedScope, resolvedScopeAccountId),
+  });
+  const messagesQuery = useInfiniteQuery({
+    queryKey: [
+      "mail",
+      "messages",
+      resolvedScope,
+      resolvedScopeAccountId,
+      folder,
+      outlookStarredSearchDisabled ? "" : debouncedSearchTerm,
+    ],
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }): Promise<MailMessagePage> => {
+      const query = {
+        scope: resolvedScope,
+        accountId: resolvedScopeAccountId,
         folder,
-        search: debouncedSearchTerm,
-      }),
-    placeholderData: (previous) => previous,
+        search: outlookStarredSearchDisabled ? "" : debouncedSearchTerm,
+        cursor: pageParam,
+        pageSize: 50,
+      };
+      if (provider.getMessagesPage) return provider.getMessagesPage(query);
+      return { messages: await provider.getMessages(query) };
+    },
+    getNextPageParam: (lastPage) => lastPage.nextCursor,
   });
 
-  const threads = messagesQuery.data ?? [];
-  const activeThread =
+  const messagePages = messagesQuery.data?.pages ?? [];
+  const threads = Array.from(
+    new Map(
+      messagePages
+        .flatMap((page) => page.messages)
+        .map((thread) => [thread.id, thread] as const),
+    ).values(),
+  );
+  const unavailableAccountIds = new Set(
+    messagePages.flatMap((page) =>
+      (page.accountErrors ?? []).map((error) => error.accountId),
+    ),
+  );
+  const hasPartialMessageResults = messagePages.some(
+    (page) =>
+      page.partial === true || (page.accountErrors?.length ?? 0) > 0,
+  );
+  const activeThreadSummary =
     threads.find((thread) => thread.id === selectedId) ?? threads[0] ?? null;
+  const activeThreadQuery = useQuery({
+    queryKey: ["mail", "message", activeThreadSummary?.id],
+    queryFn: () => provider.getMessage(activeThreadSummary!.id),
+    enabled: Boolean(activeThreadSummary),
+  });
+  const hasActiveThreadData = activeThreadQuery.data !== undefined;
+  const activeThread =
+    folder === "drafts"
+      ? (activeThreadQuery.data ?? activeThreadSummary)
+      : activeThreadQuery.data === null ||
+          (activeThreadQuery.isError && !hasActiveThreadData)
+        ? null
+        : activeThreadQuery.data === undefined
+          ? activeThreadSummary
+          : activeThreadQuery.data;
   const activeThreadPosition = activeThread
     ? threads.findIndex((thread) => thread.id === activeThread.id) + 1
     : 0;
+  const scopedAccount = accountsQuery.data?.find(
+    (account) => account.id === resolvedScopeAccountId,
+  );
   const selectedAccount =
+    scopedAccount ??
     accountsQuery.data?.find(
       (account) => account.id === activeThread?.accountId,
-    ) ?? accountsQuery.data?.[0];
+    ) ??
+    accountsQuery.data?.[0];
+  const scopeLabel = scopedAccount?.label ?? scopeLabels[resolvedScope];
+
+  async function loadDraftForEditing(
+    thread: MailThread,
+    returnFocus?: HTMLElement | null,
+  ) {
+    if (composeModeRef.current || loadingDraftIdRef.current) return;
+    const focusTarget =
+      returnFocus ??
+      (document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : composeButtonRef.current);
+    const generation = ++draftLoadGenerationRef.current;
+    loadingDraftIdRef.current = thread.id;
+    setLoadingDraftId(thread.id);
+    setToast(null);
+
+    const showLoadError = () => {
+      if (generation !== draftLoadGenerationRef.current) return;
+      setToast({
+        message: "草稿暂时无法加载，请重试。",
+        tone: "error",
+        actionLabel: "重试",
+        onAction: () => void loadDraftForEditing(thread, focusTarget),
+      });
+    };
+
+    try {
+      const draft = await provider.getDraft?.(thread.id);
+      if (
+        generation !== draftLoadGenerationRef.current ||
+        composeModeRef.current
+      )
+        return;
+      if (
+        !draft ||
+        draft.id !== thread.id ||
+        draft.accountId !== thread.accountId
+      ) {
+        showLoadError();
+        return;
+      }
+      openCompose(draft.composeIntent?.mode ?? "draft", draft, focusTarget);
+    } catch {
+      if (!composeModeRef.current) showLoadError();
+    } finally {
+      if (
+        generation === draftLoadGenerationRef.current &&
+        loadingDraftIdRef.current === thread.id
+      ) {
+        loadingDraftIdRef.current = null;
+        setLoadingDraftId(null);
+      }
+    }
+  }
+
+  const cancelDraftLoad = () => {
+    draftLoadGenerationRef.current += 1;
+    loadingDraftIdRef.current = null;
+    setLoadingDraftId(null);
+  };
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (
+      !url.searchParams.has("mail_connected") &&
+      !url.searchParams.has("mail_error")
+    )
+      return;
+    url.searchParams.delete("mail_connected");
+    url.searchParams.delete("mail_error");
+    window.history.replaceState(
+      null,
+      "",
+      `${url.pathname}${url.search}${url.hash}`,
+    );
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -323,20 +556,33 @@ function Hub({
       }
       if (searchShortcut) {
         event.preventDefault();
-        searchRef.current?.focus();
+        if (!outlookStarredSearchDisabled) searchRef.current?.focus();
       }
       if (composeShortcut) {
         event.preventDefault();
-        openCompose("new");
+        if (accountsQuery.data?.length) openCompose("new");
+        else {
+          setToast({
+            message: "Connect a mail account before composing a message.",
+            tone: "error",
+          });
+        }
       }
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [openCompose]);
+  }, [
+    accountsQuery.data?.length,
+    openCompose,
+    outlookStarredSearchDisabled,
+  ]);
 
   const refreshMail = async () => {
     try {
-      await queryClient.invalidateQueries({ queryKey: ["mail"] });
+      await queryClient.invalidateQueries(
+        { queryKey: ["mail"] },
+        { throwOnError: true },
+      );
       setToast({ message: "Mailbox refreshed" });
     } catch {
       setToast({
@@ -348,8 +594,14 @@ function Hub({
 
   const updateMessages = async () => {
     await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["mail", "messages"] }),
-      queryClient.invalidateQueries({ queryKey: ["mail", "folders"] }),
+      queryClient.invalidateQueries(
+        { queryKey: ["mail", "messages"] },
+        { throwOnError: true },
+      ),
+      queryClient.invalidateQueries(
+        { queryKey: ["mail", "folders"] },
+        { throwOnError: true },
+      ),
     ]);
   };
 
@@ -373,6 +625,102 @@ function Hub({
         tone: "error",
       });
       setSigningOut(false);
+    }
+  };
+
+  const connectMailAccount = async (mailProvider: ProviderSource) => {
+    if (pendingConnectionAction) return;
+    setPendingConnectionAction(`connect:${mailProvider}`);
+    try {
+      const response = await fetch(`/api/mail/connect/${mailProvider}/start`, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "x-csrf-token": csrfToken,
+        },
+        body: JSON.stringify({ returnTo: `/?mail_connected=${mailProvider}` }),
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      const authorizationUrl =
+        payload && typeof payload === "object"
+          ? (payload as Record<string, unknown>).authorizationUrl
+          : undefined;
+      if (!response.ok || typeof authorizationUrl !== "string") {
+        throw new Error("Mail connection could not be started");
+      }
+      const destination = new URL(authorizationUrl);
+      if (
+        destination.protocol !== "https:" ||
+        destination.username ||
+        destination.password
+      ) {
+        throw new Error("Mail provider returned an invalid authorization URL");
+      }
+      window.location.assign(destination.href);
+    } catch {
+      setToast({
+        message: `${providerLabels[mailProvider]} couldn’t be connected. Check the server configuration and try again.`,
+        tone: "error",
+      });
+      setPendingConnectionAction(null);
+    }
+  };
+
+  const disconnectMailAccount = async (account: MailAccount) => {
+    if (pendingConnectionAction) return;
+    if (!window.confirm(`Disconnect ${account.address} from this workspace?`)) {
+      return;
+    }
+    setPendingConnectionAction(`disconnect:${account.id}`);
+    try {
+      const response = await fetch("/api/mail/disconnect", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "x-csrf-token": csrfToken,
+        },
+        body: JSON.stringify({ accountId: account.id }),
+      });
+      const result = (await response.json()) as {
+        disconnected?: unknown;
+        providerRevocation?: unknown;
+      };
+      if (!response.ok || result.disconnected !== true) {
+        throw new Error("Mailbox disconnect failed");
+      }
+      setSelectedIds(new Set());
+      if (scopeAccountId === account.id) {
+        setScope("all");
+        setScopeAccountId(undefined);
+        setMobilePane("list");
+      }
+      await queryClient.invalidateQueries(
+        { queryKey: ["mail"] },
+        { throwOnError: true },
+      );
+      if (result.providerRevocation === "pending") {
+        setToast({
+          message: `${account.address} is disconnected locally. Provider revocation is queued; revoke it manually in the provider console if the warning persists.`,
+          tone: "error",
+        });
+      } else {
+        setToast({ message: `${account.address} disconnected` });
+      }
+    } catch {
+      setToast({
+        message: `${account.address} couldn’t be disconnected. Please try again.`,
+        tone: "error",
+      });
+    } finally {
+      setPendingConnectionAction(null);
     }
   };
 
@@ -413,17 +761,25 @@ function Hub({
         result.succeeded.includes(location.id),
       );
       setSelectedIds(new Set());
-      await updateMessages();
+      let refreshFailed = false;
+      try {
+        await updateMessages();
+      } catch {
+        refreshFailed = true;
+      }
 
       const action = kind === "archive" ? "archived" : "moved to Trash";
       const failureNote = result.failed.length
         ? `; ${result.failed.length} failed`
         : "";
+      const refreshNote = refreshFailed
+        ? "; operation completed, but the mailbox list couldn’t refresh"
+        : "";
       setToast({
         message: `${result.succeeded.length} message${
           result.succeeded.length === 1 ? "" : "s"
-        } ${action}${failureNote}`,
-        tone: result.failed.length ? "error" : "success",
+        } ${action}${failureNote}${refreshNote}`,
+        tone: result.failed.length || refreshFailed ? "error" : "success",
         ...(restoredLocations.length
           ? {
               actionLabel: "Undo",
@@ -434,14 +790,28 @@ function Hub({
                     const restoreResult = await provider.restoreMessages(
                       restoredLocations,
                     );
-                    await updateMessages();
+                    let restoreRefreshFailed = false;
+                    try {
+                      await updateMessages();
+                    } catch {
+                      restoreRefreshFailed = true;
+                    }
                     setToast({
-                      message: restoreResult.failed.length
-                        ? `${restoreResult.succeeded.length} restored; ${restoreResult.failed.length} failed`
+                      message: restoreRefreshFailed
+                        ? `${restoreResult.succeeded.length} restored${
+                            restoreResult.failed.length
+                              ? `; ${restoreResult.failed.length} failed`
+                              : ""
+                          }; the undo completed, but the mailbox list couldn’t refresh`
+                        : restoreResult.failed.length
+                          ? `${restoreResult.succeeded.length} restored; ${restoreResult.failed.length} failed`
                         : `${restoreResult.succeeded.length} message${
                             restoreResult.succeeded.length === 1 ? "" : "s"
                           } restored`,
-                      tone: restoreResult.failed.length ? "error" : "success",
+                      tone:
+                        restoreResult.failed.length || restoreRefreshFailed
+                          ? "error"
+                          : "success",
                     });
                   } catch {
                     setToast({
@@ -469,20 +839,65 @@ function Hub({
     }
   };
 
+  const restoreTrash = async (ids: string[]) => {
+    if (ids.length === 0 || !startMailAction("restoreTrash")) return;
+    try {
+      const result = await provider.restoreFromTrash(ids);
+      setSelectedIds(new Set());
+      try {
+        await updateMessages();
+      } catch {
+        setToast({
+          message: `${result.succeeded.length} message${
+            result.succeeded.length === 1 ? "" : "s"
+          } restored${
+            result.failed.length ? `; ${result.failed.length} failed` : ""
+          }, but the mailbox couldn’t refresh.`,
+          tone: "error",
+        });
+        return;
+      }
+      setToast({
+        message: result.failed.length
+          ? `${result.succeeded.length} restored from Trash; ${result.failed.length} failed`
+          : `${result.succeeded.length} message${
+              result.succeeded.length === 1 ? "" : "s"
+            } restored from Trash`,
+        tone: result.failed.length ? "error" : "success",
+      });
+    } catch {
+      setToast({
+        message: "Couldn’t restore the selected messages from Trash.",
+        tone: "error",
+      });
+    } finally {
+      finishMailAction();
+    }
+  };
+
   const markSelected = async (read: boolean) => {
     const ids = Array.from(selectedIds);
     if (ids.length === 0 || !startMailAction("read")) return;
     try {
       const result = await provider.markRead(ids, read);
       setSelectedIds(new Set());
-      await updateMessages();
+      let refreshFailed = false;
+      try {
+        await updateMessages();
+      } catch {
+        refreshFailed = true;
+      }
       setToast({
-        message: result.failed.length
+        message: refreshFailed
+          ? `${result.succeeded.length} updated${
+              result.failed.length ? `; ${result.failed.length} failed` : ""
+            }; the operation completed, but the mailbox list couldn’t refresh`
+          : result.failed.length
           ? `${result.succeeded.length} updated; ${result.failed.length} failed`
           : read
             ? "Marked as read"
             : "Marked as unread",
-        tone: result.failed.length ? "error" : "success",
+        tone: result.failed.length || refreshFailed ? "error" : "success",
       });
     } catch {
       setToast({
@@ -501,14 +916,21 @@ function Hub({
     try {
       const starred = !thread.starred;
       const result = await provider.setStarred(thread.id, starred);
-      await updateMessages();
+      let refreshFailed = false;
+      try {
+        await updateMessages();
+      } catch {
+        refreshFailed = true;
+      }
       setToast({
         message: result.failed.length
           ? "Couldn’t update the star."
-          : starred
-            ? "Message starred"
-            : "Star removed",
-        tone: result.failed.length ? "error" : "success",
+          : refreshFailed
+            ? "Star updated, but the mailbox list couldn’t refresh."
+            : starred
+              ? "Message starred"
+              : "Star removed",
+        tone: result.failed.length || refreshFailed ? "error" : "success",
       });
     } catch {
       setToast({ message: "Couldn’t update the star.", tone: "error" });
@@ -518,17 +940,27 @@ function Hub({
   };
 
   const openThread = async (thread: MailThread) => {
+    cancelDraftLoad();
     setSelectedId(thread.id);
     setMobilePane("reader");
-    if (thread.unread && startMailAction("read")) {
+    if (folder !== "drafts" && thread.unread && startMailAction("read")) {
       try {
         const result = await provider.markRead([thread.id], true);
-        await updateMessages();
         if (result.failed.length) {
           setToast({
             message: "Message opened, but it couldn’t be marked as read.",
             tone: "error",
           });
+        } else {
+          try {
+            await updateMessages();
+          } catch {
+            setToast({
+              message:
+                "Message was marked as read, but the mailbox list couldn’t refresh.",
+              tone: "error",
+            });
+          }
         }
       } catch {
         setToast({
@@ -541,14 +973,33 @@ function Hub({
     }
   };
 
-  const switchScope = (nextScope: Scope) => {
+  const switchScope = (nextScope: Scope, nextAccountId?: string) => {
+    cancelDraftLoad();
+    if (
+      outlookStarredSearchDisabled ||
+      (folder === "starred" && nextScope === "outlook" && nextAccountId)
+    ) {
+      setSearchTerm("");
+      setDebouncedSearchTerm("");
+    }
     setScope(nextScope);
+    setScopeAccountId(nextAccountId);
     setSelectedIds(new Set());
     setSidebarOpen(false);
     setMobilePane("list");
   };
 
   const switchFolder = (nextFolder: MailFolderId) => {
+    cancelDraftLoad();
+    if (
+      outlookStarredSearchDisabled ||
+      (nextFolder === "starred" &&
+        resolvedScope === "outlook" &&
+        resolvedScopeAccountId)
+    ) {
+      setSearchTerm("");
+      setDebouncedSearchTerm("");
+    }
     setFolder(nextFolder);
     setSelectedIds(new Set());
     setSidebarOpen(false);
@@ -602,19 +1053,32 @@ function Hub({
             <Search size={17} aria-hidden="true" />
             <input
               ref={searchRef}
-              value={searchTerm}
-              onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder={`Search ${scopeLabels[scope]}`}
-              aria-label={`Search ${scopeLabels[scope]}`}
+              value={outlookStarredSearchDisabled ? "" : searchTerm}
+              disabled={outlookStarredSearchDisabled}
+              onChange={(event) => {
+                cancelDraftLoad();
+                setSelectedIds(new Set());
+                setSearchTerm(event.target.value);
+              }}
+              placeholder={
+                outlookStarredSearchDisabled
+                  ? "Search is unavailable in Outlook Starred"
+                  : `Search ${scopeLabel}`
+              }
+              aria-label={`Search ${scopeLabel}`}
             />
             <span className="search-shortcut" aria-hidden="true">
               ⌘ K
             </span>
-            {searchTerm ? (
+            {searchTerm && !outlookStarredSearchDisabled ? (
               <button
                 type="button"
                 className="search-clear"
-                onClick={() => setSearchTerm("")}
+                onClick={() => {
+                  cancelDraftLoad();
+                  setSelectedIds(new Set());
+                  setSearchTerm("");
+                }}
                 aria-label="Clear search"
               >
                 <X size={15} />
@@ -717,6 +1181,12 @@ function Hub({
               ref={composeButtonRef}
               type="button"
               className="compose-primary"
+              disabled={!accountsQuery.data?.length}
+              title={
+                accountsQuery.data?.length
+                  ? "Compose a message"
+                  : "Connect a mail account before composing"
+              }
               onClick={() => openCompose("new")}
             >
               <PencilLine size={18} />
@@ -725,21 +1195,57 @@ function Hub({
 
             <div className="sidebar-section" aria-label="Mail accounts">
               <p className="sidebar-label">Mail spaces</p>
-              <ScopeButton
-                scope="all"
-                active={scope === "all"}
-                onClick={() => switchScope("all")}
-              />
+              {(accountsQuery.data?.length ?? 0) <= 5 ? (
+                <ScopeButton
+                  scope="all"
+                  active={resolvedScope === "all" && !resolvedScopeAccountId}
+                  onClick={() => switchScope("all")}
+                />
+              ) : (
+                <p className="scope-limit-note">
+                  Showing the first mailbox. Choose another mailbox to switch.
+                </p>
+              )}
+              {accountsQuery.isError ? (
+                <QueryErrorNotice
+                  compact
+                  title="Accounts unavailable"
+                  description={
+                    accountsQuery.data
+                      ? "Showing previously loaded accounts."
+                      : "Mail accounts couldn’t be loaded."
+                  }
+                  retrying={accountsQuery.isFetching}
+                  onRetry={() => void accountsQuery.refetch()}
+                />
+              ) : null}
               {accountsQuery.data?.map((account) => (
                 <ScopeButton
                   key={account.id}
                   scope={account.provider}
                   account={account}
-                  active={scope === account.provider}
-                  onClick={() => switchScope(account.provider)}
+                  active={
+                    resolvedScope === account.provider &&
+                    resolvedScopeAccountId === account.id
+                  }
+                  onClick={() => switchScope(account.provider, account.id)}
                 />
               ))}
             </div>
+
+            {foldersQuery.isError ? (
+              <QueryErrorNotice
+                compact
+                title="Folders unavailable"
+                description={
+                  foldersQuery.data
+                    ? "Showing previously loaded folder counts."
+                    : "Folder counts couldn’t be loaded."
+                }
+                retrying={foldersQuery.isFetching}
+                onRetry={() => void foldersQuery.refetch()}
+              />
+            ) : null}
 
             <nav className="folder-nav" aria-label="Mail folders">
               {folderConfig.map((item) => {
@@ -763,16 +1269,6 @@ function Hub({
               })}
             </nav>
 
-            <div className="sidebar-section labels-section">
-              <p className="sidebar-label">Labels</p>
-              {["Design", "Personal", "Receipts"].map((label, index) => (
-                <button type="button" className="label-link" key={label}>
-                  <span className={`label-dot label-${index + 1}`} />
-                  {label}
-                </button>
-              ))}
-            </div>
-
             <button
               type="button"
               className="sidebar-settings"
@@ -787,13 +1283,9 @@ function Hub({
             <section className="list-pane" id="message-list" aria-label="Messages">
               <div className="list-header">
                 <div>
-                  <p>{scopeLabels[scope]}</p>
+                  <p>{scopeLabel}</p>
                   <h1>{folderConfig.find((item) => item.id === folder)?.label}</h1>
                 </div>
-                <button className="folder-menu" type="button">
-                  <ChevronDown size={16} />
-                  <span className="sr-only">Folder options</span>
-                </button>
               </div>
 
               {selectedIds.size > 0 ? (
@@ -813,19 +1305,30 @@ function Hub({
                       label="Archive selected"
                       icon={Archive}
                       onClick={() => runMove("archive", Array.from(selectedIds))}
-                      disabled={Boolean(pendingMailAction)}
+                      disabled={
+                        Boolean(pendingMailAction) ||
+                        (folder !== "inbox" && folder !== "starred")
+                      }
                     />
                     <IconButton
                       label="Mark selected as read"
                       icon={MailOpen}
                       onClick={() => markSelected(true)}
-                      disabled={Boolean(pendingMailAction)}
+                      disabled={Boolean(pendingMailAction) || folder === "drafts"}
                     />
                     <IconButton
-                      label="Move selected to Trash"
-                      icon={Trash2}
-                      onClick={() => runMove("trash", Array.from(selectedIds))}
-                      disabled={Boolean(pendingMailAction)}
+                      label={
+                        folder === "trash"
+                          ? "Restore selected from Trash"
+                          : "Move selected to Trash"
+                      }
+                      icon={folder === "trash" ? RefreshCw : Trash2}
+                      onClick={() =>
+                        folder === "trash"
+                          ? restoreTrash(Array.from(selectedIds))
+                          : runMove("trash", Array.from(selectedIds))
+                      }
+                      disabled={Boolean(pendingMailAction) || folder === "drafts"}
                     />
                   </div>
                 </div>
@@ -834,6 +1337,7 @@ function Hub({
                   <button
                     className="select-all"
                     type="button"
+                    disabled={folder === "drafts"}
                     onClick={() =>
                       setSelectedIds(new Set(threads.map((thread) => thread.id)))
                     }
@@ -841,16 +1345,26 @@ function Hub({
                   >
                     <span />
                   </button>
-                  <span>{threads.length} conversations</span>
-                  <IconButton label="Filter messages" icon={Tag} />
+                  <span>
+                    {messagesQuery.isError && !messagesQuery.data
+                      ? "Messages unavailable"
+                      : `${threads.length} conversations`}
+                  </span>
                 </div>
               )}
 
               <MessageList
+                key={`${resolvedScope}:${resolvedScopeAccountId ?? "all"}:${folder}:${outlookStarredSearchDisabled ? "" : debouncedSearchTerm}`}
                 threads={threads}
                 activeId={activeThread?.id ?? null}
                 selectedIds={selectedIds}
                 loading={messagesQuery.isPending}
+                error={messagesQuery.isError}
+                hasResolvedData={Boolean(messagesQuery.data)}
+                partial={hasPartialMessageResults}
+                unavailableAccountCount={unavailableAccountIds.size}
+                retrying={messagesQuery.isFetching}
+                onRetry={() => void messagesQuery.refetch()}
                 density={density}
                 onOpen={openThread}
                 onToggleSelect={(id) => {
@@ -863,8 +1377,21 @@ function Hub({
                 }}
                 onToggleStar={toggleStar}
                 onArchive={(id) => runMove("archive", [id])}
-                onTrash={(id) => runMove("trash", [id])}
-                actionsDisabled={Boolean(pendingMailAction)}
+                archiveDisabled={
+                  Boolean(pendingMailAction) ||
+                  (folder !== "inbox" && folder !== "starred")
+                }
+                selectionDisabled={folder === "drafts"}
+                trashAction={folder === "trash" ? "restore" : "trash"}
+                onTrashAction={(id) =>
+                  folder === "trash"
+                    ? restoreTrash([id])
+                    : runMove("trash", [id])
+                }
+                actionsDisabled={Boolean(pendingMailAction) || folder === "drafts"}
+                hasMore={Boolean(messagesQuery.hasNextPage)}
+                loadingMore={messagesQuery.isFetchingNextPage}
+                onLoadMore={() => void messagesQuery.fetchNextPage()}
               />
             </section>
 
@@ -887,15 +1414,34 @@ function Hub({
               }}
               position={activeThreadPosition}
               total={threads.length}
-              actionsDisabled={Boolean(pendingMailAction)}
+              actionsDisabled={Boolean(pendingMailAction) || folder === "drafts"}
+              archiveDisabled={
+                Boolean(pendingMailAction) ||
+                (folder !== "inbox" && folder !== "starred")
+              }
+              isDraft={folder === "drafts"}
+              trashAction={folder === "trash" ? "restore" : "trash"}
+              loadError={
+                folder !== "drafts" &&
+                (activeThreadQuery.isError || activeThreadQuery.data === null)
+              }
+              retrying={activeThreadQuery.isFetching}
+              draftLoading={loadingDraftId !== null}
+              onRetry={() => void activeThreadQuery.refetch()}
               onBack={() => setMobilePane("list")}
+              onEditDraft={() =>
+                activeThread && void loadDraftForEditing(activeThread)
+              }
               onReply={() => openCompose("reply")}
               onForward={() => openCompose("forward")}
               onArchive={() =>
                 activeThread && runMove("archive", [activeThread.id])
               }
-              onTrash={() =>
-                activeThread && runMove("trash", [activeThread.id])
+              onTrashAction={() =>
+                activeThread &&
+                (folder === "trash"
+                  ? restoreTrash([activeThread.id])
+                  : runMove("trash", [activeThread.id]))
               }
             />
           </main>
@@ -903,7 +1449,15 @@ function Hub({
           <button
             type="button"
             className="compose-fab"
-            onClick={() => openCompose("new")}
+            disabled={!accountsQuery.data?.length}
+            title={
+              accountsQuery.data?.length
+                ? "Compose a message"
+                : "Connect a mail account before composing"
+            }
+            onClick={() => {
+              if (accountsQuery.data?.length) openCompose("new");
+            }}
             aria-label="Compose message"
           >
             <PencilLine size={21} />
@@ -914,6 +1468,10 @@ function Hub({
           section={settingsSection}
           setSection={setSettingsSection}
           accounts={accountsQuery.data ?? []}
+          accountsAvailable={accountsQuery.data !== undefined}
+          accountsError={accountsQuery.isError}
+          accountsRetrying={accountsQuery.isFetching}
+          onRetryAccounts={() => void accountsQuery.refetch()}
           viewer={viewer}
           theme={theme}
           setTheme={setTheme}
@@ -923,19 +1481,33 @@ function Hub({
           setExternalImages={setExternalImages}
           onBack={() => setView("mail")}
           onSignOut={() => void signOut()}
+          pendingConnectionAction={pendingConnectionAction}
+          onConnect={(mailProvider) => void connectMailAccount(mailProvider)}
+          onDisconnect={(account) => void disconnectMailAccount(account)}
         />
       )}
 
-      <AnimatePresence>
+      <AnimatePresence onExitComplete={finishComposeExit}>
         {composeMode ? (
           <ComposeDialog
-            key={composeMode}
+            key={`${composeMode}:${composeInitialDraft?.id ?? "new"}`}
             mode={composeMode}
+            initialDraft={composeInitialDraft ?? undefined}
             provider={provider}
             accounts={accountsQuery.data ?? []}
             activeThread={activeThread}
             selectedAccount={selectedAccount}
-            onClose={closeCompose}
+            onClose={(refreshDrafts = false) => {
+              closeCompose();
+              if (refreshDrafts) {
+                void updateMessages().catch(() => {
+                  setToast({
+                    message: "草稿已关闭，但邮件列表暂时无法刷新。",
+                    tone: "error",
+                  });
+                });
+              }
+            }}
             onSent={async () => {
               setToast({ message: "Message sent. Refreshing mailbox…" });
               try {
@@ -1037,119 +1609,227 @@ function ProviderMark({ provider }: { provider: ProviderSource }) {
   );
 }
 
+function QueryErrorNotice({
+  title,
+  description,
+  retrying,
+  onRetry,
+  compact = false,
+  blocking = false,
+  warning = false,
+}: {
+  title: string;
+  description: string;
+  retrying: boolean;
+  onRetry: () => void;
+  compact?: boolean;
+  blocking?: boolean;
+  warning?: boolean;
+}) {
+  return (
+    <div
+      className={`query-error${warning ? " is-warning" : ""}${compact ? " is-compact" : ""}${
+        blocking ? " is-blocking" : ""
+      }`}
+      role={warning ? "status" : "alert"}
+    >
+      <AlertCircle size={17} aria-hidden="true" />
+      <span>
+        <strong>{title}</strong>
+        <small>{description}</small>
+      </span>
+      <button type="button" disabled={retrying} onClick={onRetry}>
+        {retrying ? "Retrying…" : "Retry"}
+      </button>
+    </div>
+  );
+}
+
 function MessageList({
   threads,
   activeId,
   selectedIds,
   loading,
+  error,
+  hasResolvedData,
+  partial,
+  unavailableAccountCount,
+  retrying,
+  onRetry,
   density,
   onOpen,
   onToggleSelect,
   onToggleStar,
   onArchive,
-  onTrash,
+  archiveDisabled,
+  selectionDisabled,
+  trashAction,
+  onTrashAction,
   actionsDisabled,
+  hasMore,
+  loadingMore,
+  onLoadMore,
 }: {
   threads: MailThread[];
   activeId: string | null;
   selectedIds: Set<string>;
   loading: boolean;
+  error: boolean;
+  hasResolvedData: boolean;
+  partial: boolean;
+  unavailableAccountCount: number;
+  retrying: boolean;
+  onRetry: () => void;
   density: Density;
   onOpen: (thread: MailThread) => void;
   onToggleSelect: (id: string) => void;
   onToggleStar: (thread: MailThread) => void;
   onArchive: (id: string) => void;
-  onTrash: (id: string) => void;
+  archiveDisabled: boolean;
+  selectionDisabled: boolean;
+  trashAction: "trash" | "restore";
+  onTrashAction: (id: string) => void;
   actionsDisabled: boolean;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
 }) {
   const parentRef = useRef<HTMLDivElement>(null);
-  const [loadedCount, setLoadedCount] = useState(18);
-  const visibleThreads = threads.slice(0, loadedCount);
   const rowHeight =
     density === "compact" ? 58 : density === "relaxed" ? 78 : 68;
   // TanStack Virtual intentionally returns imperative measurement functions.
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
-    count: visibleThreads.length,
+    count: threads.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => rowHeight,
     overscan: 6,
   });
 
-  useEffect(() => {
-    setLoadedCount(18);
-    parentRef.current?.scrollTo({ top: 0 });
-  }, [threads]);
+  const retainedDataWarning =
+    error && hasResolvedData ? (
+      <QueryErrorNotice
+        title="Messages couldn’t refresh"
+        description="Showing the conversations that were already loaded."
+        retrying={retrying}
+        onRetry={onRetry}
+      />
+    ) : null;
+  const partialDataWarning = partial ? (
+    <QueryErrorNotice
+      warning
+      title="部分账号暂不可用"
+      description={
+        unavailableAccountCount > 0
+          ? `${unavailableAccountCount} 个账号暂未完成同步，已显示其他账号的邮件。`
+          : "部分账号暂未完成同步，已显示其他账号的邮件。"
+      }
+      retrying={retrying}
+      onRetry={onRetry}
+    />
+  ) : null;
+
+  if (error && !hasResolvedData) {
+    return (
+      <div className="message-list-region">
+        <QueryErrorNotice
+          blocking
+          title="Messages couldn’t be loaded"
+          description="Check the connection and try this mailbox again."
+          retrying={retrying}
+          onRetry={onRetry}
+        />
+      </div>
+    );
+  }
 
   if (loading) {
     return (
-      <div className="message-skeletons" aria-label="Loading messages">
-        {Array.from({ length: 8 }, (_, index) => (
-          <div className="message-skeleton" key={index}>
-            <span />
-            <div>
-              <i />
-              <i />
+      <div className="message-list-region">
+        <div className="message-skeletons" aria-label="Loading messages">
+          {Array.from({ length: 8 }, (_, index) => (
+            <div className="message-skeleton" key={index}>
+              <span />
+              <div>
+                <i />
+                <i />
+              </div>
             </div>
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
     );
   }
 
   if (threads.length === 0) {
     return (
-      <div className="empty-list">
-        <MailOpen size={24} />
-        <h2>No conversations here</h2>
-        <p>Try another account, folder, or clear the current search.</p>
+      <div className="message-list-region">
+        {retainedDataWarning}
+        {partialDataWarning}
+        <div className="empty-list">
+          <MailOpen size={24} />
+          <h2>{partial ? "暂时无法显示全部邮件" : "No conversations here"}</h2>
+          <p>
+            {partial
+              ? "已成功加载的账号中没有匹配邮件；其他账号恢复后请重试。"
+              : "Try another account, folder, or clear the current search."}
+          </p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="virtual-list" ref={parentRef}>
-      <div
-        className="virtual-list-inner"
-        style={{ height: virtualizer.getTotalSize() }}
-      >
-        {virtualizer.getVirtualItems().map((virtualRow) => {
-          const thread = visibleThreads[virtualRow.index];
-          return (
-            <div
-              key={thread.id}
-              className="virtual-row"
-              style={{
-                height: virtualRow.size,
-                transform: `translateY(${virtualRow.start}px)`,
-              }}
-            >
-              <MessageRow
-                thread={thread}
-                active={thread.id === activeId}
-                selected={selectedIds.has(thread.id)}
-                onOpen={() => onOpen(thread)}
-                onToggleSelect={() => onToggleSelect(thread.id)}
-                onToggleStar={() => onToggleStar(thread)}
-                onArchive={() => onArchive(thread.id)}
-                onTrash={() => onTrash(thread.id)}
-                actionsDisabled={actionsDisabled}
-              />
-            </div>
-          );
-        })}
-      </div>
-      {loadedCount < threads.length ? (
-        <button
-          type="button"
-          className="load-more"
-          onClick={() => setLoadedCount((count) => count + 18)}
+    <div className="message-list-region">
+      {retainedDataWarning}
+      {partialDataWarning}
+      <div className="virtual-list" ref={parentRef}>
+        <div
+          className="virtual-list-inner"
+          style={{ height: virtualizer.getTotalSize() }}
         >
-          Load more
-        </button>
-      ) : (
-        <div className="list-end">You’re all caught up</div>
-      )}
+          {virtualizer.getVirtualItems().map((virtualRow) => {
+            const thread = threads[virtualRow.index];
+            return (
+              <div
+                key={thread.id}
+                className="virtual-row"
+                style={{
+                  height: virtualRow.size,
+                  transform: `translateY(${virtualRow.start}px)`,
+                }}
+              >
+                <MessageRow
+                  thread={thread}
+                  active={thread.id === activeId}
+                  selected={selectedIds.has(thread.id)}
+                  onOpen={() => onOpen(thread)}
+                  onToggleSelect={() => onToggleSelect(thread.id)}
+                  onToggleStar={() => onToggleStar(thread)}
+                  onArchive={() => onArchive(thread.id)}
+                  archiveDisabled={archiveDisabled}
+                  selectionDisabled={selectionDisabled}
+                  trashAction={trashAction}
+                  onTrashAction={() => onTrashAction(thread.id)}
+                  actionsDisabled={actionsDisabled}
+                />
+              </div>
+            );
+          })}
+        </div>
+        {hasMore ? (
+          <button
+            type="button"
+            className="load-more"
+            disabled={loadingMore}
+            onClick={onLoadMore}
+          >
+            {loadingMore ? "Loading…" : "Load more"}
+          </button>
+        ) : (
+          <div className="list-end">You’re all caught up</div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1162,7 +1842,10 @@ function MessageRow({
   onToggleSelect,
   onToggleStar,
   onArchive,
-  onTrash,
+  archiveDisabled,
+  selectionDisabled,
+  trashAction,
+  onTrashAction,
   actionsDisabled,
 }: {
   thread: MailThread;
@@ -1172,7 +1855,10 @@ function MessageRow({
   onToggleSelect: () => void;
   onToggleStar: () => void;
   onArchive: () => void;
-  onTrash: () => void;
+  archiveDisabled: boolean;
+  selectionDisabled: boolean;
+  trashAction: "trash" | "restore";
+  onTrashAction: () => void;
   actionsDisabled: boolean;
 }) {
   const [swipe, setSwipe] = useState(0);
@@ -1197,13 +1883,29 @@ function MessageRow({
   return (
     <div className="swipe-shell">
       <div className="swipe-actions swipe-actions-left">
-        <button type="button" onClick={onArchive} disabled={actionsDisabled}>
+        <button type="button" onClick={onArchive} disabled={archiveDisabled}>
           <Archive size={17} /> Archive
         </button>
       </div>
-      <div className="swipe-actions swipe-actions-right">
-        <button type="button" onClick={onTrash} disabled={actionsDisabled}>
-          <Trash2 size={17} /> Trash
+      <div
+        className={`swipe-actions swipe-actions-right${
+          trashAction === "restore" ? " is-restore" : ""
+        }`}
+      >
+        <button
+          type="button"
+          onClick={onTrashAction}
+          disabled={actionsDisabled}
+        >
+          {trashAction === "restore" ? (
+            <>
+              <RefreshCw size={17} /> Restore
+            </>
+          ) : (
+            <>
+              <Trash2 size={17} /> Trash
+            </>
+          )}
         </button>
       </div>
       <div
@@ -1219,6 +1921,7 @@ function MessageRow({
         <button
           type="button"
           className="message-select"
+          disabled={selectionDisabled}
           onClick={(event) => {
             event.stopPropagation();
             onToggleSelect();
@@ -1254,9 +1957,6 @@ function MessageRow({
           <span className="message-line-two">
             <strong>{thread.subject}</strong>
             <span className="row-meta">
-              {thread.messages.some((message) => message.attachments.length) ? (
-                <Paperclip size={13} aria-label="Has attachment" />
-              ) : null}
               <ProviderMark provider={thread.provider} />
             </span>
           </span>
@@ -1287,11 +1987,19 @@ function ReaderPane({
   position,
   total,
   actionsDisabled,
+  archiveDisabled,
+  isDraft,
+  trashAction,
+  loadError,
+  retrying,
+  draftLoading,
+  onRetry,
   onBack,
+  onEditDraft,
   onReply,
   onForward,
   onArchive,
-  onTrash,
+  onTrashAction,
 }: {
   thread: MailThread | null;
   externalImages: boolean;
@@ -1299,18 +2007,38 @@ function ReaderPane({
   position: number;
   total: number;
   actionsDisabled: boolean;
+  archiveDisabled: boolean;
+  isDraft: boolean;
+  trashAction: "trash" | "restore";
+  loadError: boolean;
+  retrying: boolean;
+  draftLoading: boolean;
+  onRetry: () => void;
   onBack: () => void;
+  onEditDraft: () => void;
   onReply: () => void;
   onForward: () => void;
   onArchive: () => void;
-  onTrash: () => void;
+  onTrashAction: () => void;
 }) {
-  const [expanded, setExpanded] = useState<Set<string>>(() => {
-    const latestMessageId = thread?.messages.at(-1)?.id;
-    return latestMessageId ? new Set([latestMessageId]) : new Set();
-  });
+  const [expansionOverrides, setExpansionOverrides] = useState<
+    Map<string, boolean>
+  >(() => new Map());
 
   if (!thread) {
+    if (loadError) {
+      return (
+        <section className="reader-pane reader-empty" id="reader-pane">
+          <QueryErrorNotice
+            blocking
+            title="Conversation couldn’t be loaded"
+            description="The message summary is still in the list. Retry to load its full details."
+            retrying={retrying}
+            onRetry={onRetry}
+          />
+        </section>
+      );
+    }
     return (
       <section className="reader-pane reader-empty" id="reader-pane">
         <div className="reader-empty-mark">
@@ -1336,15 +2064,18 @@ function ReaderPane({
             label="Archive message"
             icon={Archive}
             onClick={onArchive}
-            disabled={actionsDisabled}
+            disabled={archiveDisabled}
           />
           <IconButton
-            label="Move message to Trash"
-            icon={Trash2}
-            onClick={onTrash}
+            label={
+              trashAction === "restore"
+                ? "Restore message from Trash"
+                : "Move message to Trash"
+            }
+            icon={trashAction === "restore" ? RefreshCw : Trash2}
+            onClick={onTrashAction}
             disabled={actionsDisabled}
           />
-          <IconButton label="More message actions" icon={MoreHorizontal} />
         </div>
         <div className="reader-position">
           {position > 0 ? `${position} of ${total}` : `${total} conversations`}
@@ -1352,6 +2083,14 @@ function ReaderPane({
       </div>
 
       <div className="reader-scroll">
+        {loadError ? (
+          <QueryErrorNotice
+            title="Conversation couldn’t refresh"
+            description="Showing the full details that were already loaded."
+            retrying={retrying}
+            onRetry={onRetry}
+          />
+        ) : null}
         <header className="subject-header">
           <div className="subject-meta">
             <ProviderMark provider={thread.provider} />
@@ -1370,7 +2109,8 @@ function ReaderPane({
           </div>
         </header>
 
-        {thread.hasExternalImages && !externalImages ? (
+        {thread.messages.some((message) => Boolean(message.contentUrl)) &&
+        !externalImages ? (
           <div className="image-guard">
             <ImageOff size={17} />
             <div>
@@ -1386,18 +2126,18 @@ function ReaderPane({
         <div className="thread-stack">
           {thread.messages.map((message, index) => {
             const current = index === thread.messages.length - 1;
-            const isExpanded = expanded.has(message.id);
+            const isExpanded = expansionOverrides.get(message.id) ?? current;
             return (
               <ThreadArticle
                 key={message.id}
                 message={message}
+                externalImages={externalImages}
                 expanded={isExpanded}
                 current={current}
                 onToggle={() => {
-                  setExpanded((items) => {
-                    const next = new Set(items);
-                    if (next.has(message.id)) next.delete(message.id);
-                    else next.add(message.id);
+                  setExpansionOverrides((items) => {
+                    const next = new Map(items);
+                    next.set(message.id, !isExpanded);
                     return next;
                   });
                 }}
@@ -1406,32 +2146,52 @@ function ReaderPane({
           })}
         </div>
 
-        <div className="thread-actions">
-          <button type="button" onClick={onReply}>
-            <Reply size={17} /> Reply
-          </button>
-          <button type="button" onClick={onForward}>
-            <Forward size={17} /> Forward
-          </button>
-        </div>
+        {!isDraft ? (
+          <div className="thread-actions">
+            <button type="button" onClick={onReply}>
+              <Reply size={17} /> Reply
+            </button>
+            <button type="button" onClick={onForward}>
+              <Forward size={17} /> Forward
+            </button>
+          </div>
+        ) : null}
       </div>
 
-      <button className="quick-reply" type="button" onClick={onReply}>
-        <span className="quick-avatar">PH</span>
-        <span>Reply to {thread.sender.name}…</span>
-        <Reply size={17} />
-      </button>
+      {isDraft ? (
+        <button
+          className="quick-reply"
+          type="button"
+          disabled={draftLoading}
+          aria-busy={draftLoading}
+          onClick={onEditDraft}
+        >
+          <span className="quick-avatar">
+            <PencilLine size={15} aria-hidden="true" />
+          </span>
+          <span>{draftLoading ? "正在加载草稿…" : "继续编辑"}</span>
+          <ChevronRight size={17} aria-hidden="true" />
+        </button>
+      ) : (
+        <button className="quick-reply" type="button" onClick={onReply}>
+          <span className="quick-avatar">PH</span>
+          <span>Reply to the latest sender…</span>
+          <Reply size={17} />
+        </button>
+      )}
     </section>
   );
 }
 
 function ThreadArticle({
   message,
+  externalImages,
   expanded,
   current,
   onToggle,
 }: {
   message: ThreadMessage;
+  externalImages: boolean;
   expanded: boolean;
   current: boolean;
   onToggle: () => void;
@@ -1449,7 +2209,13 @@ function ThreadArticle({
         </span>
         <span className="thread-sender">
           <strong>{message.sender.name}</strong>
-          <small>to me</small>
+          <small>
+            {message.recipients.length
+              ? `to ${message.recipients
+                  .map((recipient) => recipient.name || recipient.email)
+                  .join(", ")}`
+              : "recipients unavailable"}
+          </small>
         </span>
         {!expanded ? <span className="collapsed-preview">Message history</span> : null}
         <time
@@ -1466,9 +2232,25 @@ function ThreadArticle({
       </button>
       {expanded ? (
         <div className="message-body">
-          {message.body.map((paragraph) => (
-            <p key={paragraph}>{paragraph}</p>
-          ))}
+          {message.contentUrl ? (
+            <iframe
+              src={mailContentUrl(message.contentUrl, externalImages)}
+              sandbox=""
+              referrerPolicy="no-referrer"
+              loading="lazy"
+              title={`Message from ${message.sender.name}`}
+              style={{
+                display: "block",
+                width: "100%",
+                minHeight: 320,
+                border: 0,
+              }}
+            />
+          ) : (
+            message.body.map((paragraph, index) => (
+              <p key={`${index}:${paragraph}`}>{paragraph}</p>
+            ))
+          )}
           {message.attachments.length > 0 ? (
             <div className="attachments" aria-label="Attachments">
               {message.attachments.map((attachment) => {
@@ -1478,8 +2260,8 @@ function ThreadArticle({
                     : attachment.kind === "archive"
                       ? FileArchive
                       : FileText;
-                return (
-                  <button type="button" className="attachment" key={attachment.id}>
+                const attachmentContent = (
+                  <>
                     <span className="attachment-icon">
                       <AttachmentIcon size={19} />
                     </span>
@@ -1488,6 +2270,27 @@ function ThreadArticle({
                       <small>{attachment.size}</small>
                     </span>
                     <Download size={16} />
+                  </>
+                );
+                return attachment.downloadUrl ? (
+                  <a
+                    className="attachment"
+                    href={attachment.downloadUrl}
+                    download={attachment.name}
+                    key={attachment.id}
+                    style={{ textDecoration: "none" }}
+                  >
+                    {attachmentContent}
+                  </a>
+                ) : (
+                  <button
+                    type="button"
+                    className="attachment"
+                    disabled
+                    title="This attachment is not available for download"
+                    key={attachment.id}
+                  >
+                    {attachmentContent}
                   </button>
                 );
               })}
@@ -1499,8 +2302,14 @@ function ThreadArticle({
   );
 }
 
+function mailContentUrl(contentUrl: string, externalImages: boolean): string {
+  if (!externalImages) return contentUrl;
+  return `${contentUrl}${contentUrl.includes("?") ? "&" : "?"}externalImages=1`;
+}
+
 function ComposeDialog({
   mode,
+  initialDraft,
   provider,
   accounts,
   activeThread,
@@ -1509,53 +2318,78 @@ function ComposeDialog({
   onSent,
 }: {
   mode: ComposeMode;
+  initialDraft?: MailDraft;
   provider: MailProvider;
   accounts: MailAccount[];
   activeThread: MailThread | null;
   selectedAccount?: MailAccount;
-  onClose: () => void;
+  onClose: (refreshDrafts?: boolean) => void;
   onSent: () => Promise<void>;
 }) {
   const reduceMotion = useReducedMotion();
   const dialogRef = useRef<HTMLElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [accountId, setAccountId] = useState(
-    selectedAccount?.id ?? accounts[0]?.id ?? "",
+    initialDraft?.accountId ?? selectedAccount?.id ?? accounts[0]?.id ?? "",
   );
   const resolvedAccountId =
     accountId || selectedAccount?.id || accounts[0]?.id || "";
   const [recipient, setRecipient] = useState(
-    mode === "reply" ? activeThread?.sender.email ?? "" : "",
+    initialDraft?.to.join(", ") ??
+      (mode === "reply" ? replyRecipient(activeThread, selectedAccount) : ""),
   );
-  const [cc, setCc] = useState("");
-  const [bcc, setBcc] = useState("");
+  const [cc, setCc] = useState(initialDraft?.cc.join(", ") ?? "");
+  const [bcc, setBcc] = useState(initialDraft?.bcc.join(", ") ?? "");
   const [subject, setSubject] = useState(
-    mode === "reply"
-      ? `Re: ${activeThread?.subject ?? ""}`
-      : mode === "forward"
-        ? `Fwd: ${activeThread?.subject ?? ""}`
-        : "",
+    initialDraft?.subject ??
+      (mode === "reply"
+        ? `Re: ${activeThread?.subject ?? ""}`
+        : mode === "forward"
+          ? `Fwd: ${activeThread?.subject ?? ""}`
+          : ""),
   );
-  const [body, setBody] = useState("");
-  const [showCopies, setShowCopies] = useState(false);
+  const [body, setBody] = useState(initialDraft?.body ?? "");
+  const [showCopies, setShowCopies] = useState(
+    Boolean(initialDraft?.cc.length || initialDraft?.bcc.length),
+  );
   const [sending, setSending] = useState(false);
   const [closing, setClosing] = useState(false);
+  const [addingAttachments, setAddingAttachments] = useState(false);
   const [saveState, setSaveState] = useState<
     "idle" | "dirty" | "saving" | "saved" | "error"
-  >("idle");
-  const [attachments, setAttachments] = useState<MailAttachment[]>([]);
+  >(initialDraft?.id ? "saved" : "idle");
+  const [attachments, setAttachments] = useState<MailAttachment[]>(() =>
+    (initialDraft?.attachments ?? []).map((attachment) => ({ ...attachment })),
+  );
+  const [accountSelectionLocked, setAccountSelectionLocked] = useState(
+    mode !== "new" || Boolean(initialDraft?.id),
+  );
   const [composeError, setComposeError] = useState<string | null>(null);
-  const [activeFormats, setActiveFormats] = useState<Set<string>>(new Set());
-  const draftIdRef = useRef<string | undefined>(undefined);
+  const draftIdRef = useRef<string | undefined>(initialDraft?.id);
   const draftRevisionRef = useRef(0);
-  const lastSavedRevisionRef = useRef(-1);
+  const lastSavedRevisionRef = useRef(initialDraft?.id ? 0 : -1);
   const accountIdRef = useRef(resolvedAccountId);
+  const accountSelectionLockedRef = useRef(
+    mode !== "new" || Boolean(initialDraft?.id),
+  );
+  const composePhaseRef = useRef<"editing" | "closing" | "sending">(
+    "editing",
+  );
+  const autosaveTimerRef = useRef<number | null>(null);
+  const attachmentTaskRef = useRef(false);
+  const sourceThreadIdRef = useRef(
+    initialDraft?.composeIntent?.sourceId ?? activeThread?.id,
+  );
   const draftSavePromiseRef = useRef<
-    Promise<{ id: string; savedAt: string }> | null
+    {
+      accountId: string;
+      promise: Promise<{ id: string; savedAt: string }>;
+    } | null
   >(null);
   const selected = accounts.find(
     (account) => account.id === resolvedAccountId,
   );
-  const composeLocked = sending || closing;
+  const composeLocked = sending || closing || addingAttachments;
   const hasDraftContent = Boolean(
     recipient || cc || bcc || subject || body || attachments.length,
   );
@@ -1565,37 +2399,128 @@ function ComposeDialog({
   }, [resolvedAccountId]);
 
   const markDraftDirty = () => {
+    accountSelectionLockedRef.current = true;
+    setAccountSelectionLocked(true);
     draftRevisionRef.current += 1;
     setSaveState("dirty");
     setComposeError(null);
   };
 
+  const addAttachments = async (files: File[]) => {
+    const resetInput = () => {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    };
+    if (files.length === 0) {
+      resetInput();
+      return;
+    }
+    if (composePhaseRef.current !== "editing" || attachmentTaskRef.current) {
+      resetInput();
+      return;
+    }
+    if (attachments.length + files.length > MAX_COMPOSE_ATTACHMENTS) {
+      setComposeError(`You can attach up to ${MAX_COMPOSE_ATTACHMENTS} files.`);
+      resetInput();
+      return;
+    }
+    const invalidName = files.find(
+      (file) => !file.name.trim() || file.name.length > 255,
+    );
+    if (invalidName) {
+      setComposeError("Attachment names must be between 1 and 255 characters.");
+      resetInput();
+      return;
+    }
+    const emptyFile = files.find((file) => file.size === 0);
+    if (emptyFile) {
+      setComposeError(`${emptyFile.name} is empty and can’t be attached.`);
+      resetInput();
+      return;
+    }
+    const oversizedFile = files.find((file) => file.size > MAX_ATTACHMENT_BYTES);
+    if (oversizedFile) {
+      setComposeError(
+        `${oversizedFile.name} is larger than the 5 MB file limit.`,
+      );
+      resetInput();
+      return;
+    }
+    const existingBytes = attachments.reduce(
+      (total, attachment) => total + (attachment.sizeBytes ?? 0),
+      0,
+    );
+    const selectedBytes = files.reduce((total, file) => total + file.size, 0);
+    if (existingBytes + selectedBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+      setComposeError("Attachments can’t exceed 5 MB in total.");
+      resetInput();
+      return;
+    }
+
+    attachmentTaskRef.current = true;
+    setAddingAttachments(true);
+    setComposeError(null);
+    try {
+      const encoded = await Promise.all(
+        files.map(async (file): Promise<MailAttachment> => ({
+          id: window.crypto.randomUUID(),
+          name: file.name,
+          size: formatFileSize(file.size),
+          sizeBytes: file.size,
+          mimeType:
+            file.type && file.type.length <= 255
+              ? file.type
+              : "application/octet-stream",
+          kind: attachmentKind(file),
+          contentBase64: await fileToBase64(file),
+        })),
+      );
+      setAttachments((current) => [...current, ...encoded]);
+      markDraftDirty();
+    } catch {
+      setComposeError("The selected files couldn’t be read. Choose them again.");
+    } finally {
+      attachmentTaskRef.current = false;
+      setAddingAttachments(false);
+      resetInput();
+    }
+  };
+
   const createDraft = (): MailDraft => ({
     id: draftIdRef.current,
-    accountId: resolvedAccountId,
-    to: recipient ? [recipient.trim()] : [],
+    accountId: accountIdRef.current,
+    to: splitRecipients(recipient),
     cc: splitRecipients(cc),
     bcc: splitRecipients(bcc),
     subject,
     body,
     attachments,
+    composeIntent: composeIntentFor(mode, sourceThreadIdRef.current),
   });
 
   useEffect(() => {
-    if (sending || closing) return;
+    if (sending || closing || composePhaseRef.current !== "editing") return;
     if (!selected?.capabilities.reliableDraftUpdates) return;
     if (!hasDraftContent || saveState !== "dirty") return;
     const revision = draftRevisionRef.current;
     const timeout = window.setTimeout(() => {
+      if (autosaveTimerRef.current === timeout) autosaveTimerRef.current = null;
+      if (
+        composePhaseRef.current !== "editing" ||
+        revision !== draftRevisionRef.current
+      )
+        return;
+      accountSelectionLockedRef.current = true;
+      setAccountSelectionLocked(true);
       const draft: MailDraft = {
         id: draftIdRef.current,
-        accountId: resolvedAccountId,
-        to: recipient ? [recipient] : [],
+        accountId: accountIdRef.current,
+        to: splitRecipients(recipient),
         cc: splitRecipients(cc),
         bcc: splitRecipients(bcc),
         subject,
         body,
         attachments,
+        composeIntent: composeIntentFor(mode, sourceThreadIdRef.current),
       };
 
       void (async () => {
@@ -1605,20 +2530,28 @@ function ComposeDialog({
         const savePromise = (async () => {
           let previousDraft: { id: string; savedAt: string } | null = null;
           try {
-            previousDraft = await previousSave;
+            previousDraft = (await previousSave?.promise) ?? null;
           } catch {
             // A newer snapshot should still be allowed to retry the save.
           }
+          if (accountIdRef.current !== draft.accountId) {
+            throw new Error("Draft account changed before save");
+          }
           return provider.saveDraft({
             ...draft,
-            id: draftIdRef.current ?? previousDraft?.id,
+            id:
+              draftIdRef.current ??
+              (previousSave?.accountId === draft.accountId
+                ? previousDraft?.id
+                : undefined),
           });
         })();
-        draftSavePromiseRef.current = savePromise;
+        const saveEntry = { accountId: draft.accountId, promise: savePromise };
+        draftSavePromiseRef.current = saveEntry;
         try {
           const savedDraft = await savePromise;
-          draftIdRef.current = savedDraft.id;
           if (accountIdRef.current === draft.accountId) {
+            draftIdRef.current = savedDraft.id;
             lastSavedRevisionRef.current = revision;
             if (revision === draftRevisionRef.current) setSaveState("saved");
           }
@@ -1633,13 +2566,17 @@ function ComposeDialog({
             );
           }
         } finally {
-          if (draftSavePromiseRef.current === savePromise) {
+          if (draftSavePromiseRef.current === saveEntry) {
             draftSavePromiseRef.current = null;
           }
         }
       })();
     }, 700);
-    return () => window.clearTimeout(timeout);
+    autosaveTimerRef.current = timeout;
+    return () => {
+      window.clearTimeout(timeout);
+      if (autosaveTimerRef.current === timeout) autosaveTimerRef.current = null;
+    };
   }, [
     resolvedAccountId,
     attachments,
@@ -1647,6 +2584,7 @@ function ComposeDialog({
     body,
     cc,
     hasDraftContent,
+    mode,
     provider,
     recipient,
     saveState,
@@ -1657,24 +2595,45 @@ function ComposeDialog({
   ]);
 
   const requestClose = async () => {
-    if (closing || sending) return;
     if (
-      draftRevisionRef.current === 0 ||
-      !hasDraftContent ||
-      saveState === "saved"
+      composePhaseRef.current !== "editing" ||
+      attachmentTaskRef.current
+    )
+      return;
+    composePhaseRef.current = "closing";
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+    const currentRevision = draftRevisionRef.current;
+    if (
+      currentRevision === 0 ||
+      (!hasDraftContent && !draftIdRef.current) ||
+      lastSavedRevisionRef.current === currentRevision
     ) {
-      onClose();
+      onClose(
+        currentRevision > 0 &&
+          Boolean(draftIdRef.current) &&
+          lastSavedRevisionRef.current === currentRevision,
+      );
       return;
     }
 
+    accountSelectionLockedRef.current = true;
+    setAccountSelectionLocked(true);
     setClosing(true);
     setSaveState("saving");
     setComposeError(null);
     try {
-      const currentRevision = draftRevisionRef.current;
+      const pendingSave = draftSavePromiseRef.current;
       try {
-        const pendingDraft = await draftSavePromiseRef.current;
-        if (pendingDraft) draftIdRef.current ??= pendingDraft.id;
+        const pendingDraft = await pendingSave?.promise;
+        if (
+          pendingDraft &&
+          pendingSave?.accountId === accountIdRef.current
+        ) {
+          draftIdRef.current ??= pendingDraft.id;
+        }
       } catch {
         // Retry below with the latest complete draft snapshot.
       }
@@ -1684,14 +2643,15 @@ function ComposeDialog({
         lastSavedRevisionRef.current = currentRevision;
       }
       setSaveState("saved");
-      onClose();
+      onClose(true);
     } catch {
+      composePhaseRef.current = "editing";
       setSaveState("error");
       setComposeError(
         "Draft couldn’t be saved, so the composer stayed open. Please try again.",
       );
     } finally {
-      setClosing(false);
+      if (composePhaseRef.current === "editing") setClosing(false);
     }
   };
 
@@ -1700,44 +2660,55 @@ function ComposeDialog({
       !resolvedAccountId ||
       !recipient.trim() ||
       !subject.trim() ||
-      sending ||
-      closing
+      composePhaseRef.current !== "editing" ||
+      attachmentTaskRef.current
     )
       return;
+    composePhaseRef.current = "sending";
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+    accountSelectionLockedRef.current = true;
+    setAccountSelectionLocked(true);
     setSending(true);
     setComposeError(null);
+    let sent = false;
     try {
+      const pendingSave = draftSavePromiseRef.current;
       try {
-        const pendingDraft = await draftSavePromiseRef.current;
-        if (pendingDraft) draftIdRef.current ??= pendingDraft.id;
+        const pendingDraft = await pendingSave?.promise;
+        if (
+          pendingDraft &&
+          pendingSave?.accountId === accountIdRef.current
+        ) {
+          draftIdRef.current ??= pendingDraft.id;
+        }
       } catch {
         // Sending can continue with the current text if auto-save failed.
       }
       const draft = createDraft();
-      if (mode === "reply" && activeThread) {
-        await provider.replyMessage(activeThread.id, draft);
-      } else if (mode === "forward" && activeThread) {
-        await provider.forwardMessage(activeThread.id, draft);
+      if (mode === "reply" || mode === "forward") {
+        const sourceId = sourceThreadIdRef.current;
+        if (!sourceId) throw new Error("Reply or forward source is unavailable");
+        if (mode === "reply") await provider.replyMessage(sourceId, draft);
+        else await provider.forwardMessage(sourceId, draft);
       } else {
         await provider.sendMessage(draft);
       }
       await onSent();
+      sent = true;
     } catch {
+      composePhaseRef.current = "editing";
       setComposeError(
         "Message couldn’t be sent. Check the recipients and try again.",
       );
     } finally {
-      setSending(false);
+      if (!sent) {
+        composePhaseRef.current = "editing";
+        setSending(false);
+      }
     }
-  };
-
-  const toggleFormat = (format: string) => {
-    setActiveFormats((current) => {
-      const next = new Set(current);
-      if (next.has(format)) next.delete(format);
-      else next.add(format);
-      return next;
-    });
   };
 
   return (
@@ -1801,7 +2772,13 @@ function ComposeDialog({
           <div>
             <span className="compose-mark" />
             <h2 id="compose-title">
-              {mode === "new" ? "New message" : mode === "reply" ? "Reply" : "Forward"}
+              {mode === "new"
+                ? "New message"
+                : mode === "reply"
+                  ? "Reply"
+                  : mode === "forward"
+                    ? "Forward"
+                    : "Edit draft"}
             </h2>
           </div>
           <div className="draft-state" aria-live="polite">
@@ -1831,7 +2808,7 @@ function ComposeDialog({
             label="Close compose"
             icon={X}
             onClick={() => void requestClose()}
-            disabled={closing || sending}
+            disabled={composeLocked}
           />
         </header>
 
@@ -1840,11 +2817,14 @@ function ComposeDialog({
             <span>From</span>
             <select
               value={resolvedAccountId}
-              disabled={composeLocked}
+              disabled={composeLocked || accountSelectionLocked}
               onChange={(event) => {
+                if (accountSelectionLockedRef.current) return;
                 accountIdRef.current = event.target.value;
                 lastSavedRevisionRef.current = -1;
-                markDraftDirty();
+                draftIdRef.current = undefined;
+                setSaveState("idle");
+                setComposeError(null);
                 setAccountId(event.target.value);
               }}
             >
@@ -1860,6 +2840,7 @@ function ComposeDialog({
             <input
               autoFocus
               type="email"
+              multiple
               value={recipient}
               disabled={composeLocked}
               onChange={(event) => {
@@ -1922,29 +2903,6 @@ function ComposeDialog({
           </label>
         </div>
 
-        <div className="format-toolbar" role="toolbar" aria-label="Message formatting">
-          {[
-            ["bold", Bold, "Bold"],
-            ["italic", Italic, "Italic"],
-            ["underline", Underline, "Underline"],
-            ["list", List, "Bulleted list"],
-            ["ordered", ListOrdered, "Numbered list"],
-            ["link", Link2, "Add link"],
-          ].map(([id, Icon, label]) => (
-            <button
-              key={id as string}
-              type="button"
-              disabled={composeLocked}
-              className={activeFormats.has(id as string) ? "is-active" : ""}
-              onClick={() => toggleFormat(id as string)}
-              aria-label={label as string}
-              aria-pressed={activeFormats.has(id as string)}
-            >
-              <Icon size={16} />
-            </button>
-          ))}
-        </div>
-
         <label className="compose-body">
           <span className="sr-only">Message body</span>
           <textarea
@@ -2005,24 +2963,26 @@ function ComposeDialog({
             <button
               type="button"
               className="attach-button"
-              disabled={attachments.length > 0 || sending || closing}
-              onClick={() => {
-                markDraftDirty();
-                setAttachments([
-                  {
-                    id: "compose-project-note",
-                    name: "project-note.pdf",
-                    size: "248 KB",
-                    kind: "document",
-                  },
-                ]);
-              }}
+              disabled={
+                attachments.length >= MAX_COMPOSE_ATTACHMENTS || composeLocked
+              }
+              onClick={() => fileInputRef.current?.click()}
             >
               <Paperclip size={17} />
               <span className="sr-only">Attach file</span>
             </button>
+            <input
+              ref={fileInputRef}
+              hidden
+              type="file"
+              multiple
+              disabled={composeLocked}
+              onChange={(event) =>
+                void addAttachments(Array.from(event.currentTarget.files ?? []))
+              }
+            />
           </div>
-          <span>⌘ Enter shortcut is off</span>
+          <span>Up to 10 files · 5 MB each and total</span>
         </footer>
       </motion.section>
     </motion.div>
@@ -2033,6 +2993,10 @@ function SettingsView({
   section,
   setSection,
   accounts,
+  accountsAvailable,
+  accountsError,
+  accountsRetrying,
+  onRetryAccounts,
   viewer,
   theme,
   setTheme,
@@ -2042,10 +3006,17 @@ function SettingsView({
   setExternalImages,
   onBack,
   onSignOut,
+  pendingConnectionAction,
+  onConnect,
+  onDisconnect,
 }: {
   section: string;
   setSection: (section: string) => void;
   accounts: MailAccount[];
+  accountsAvailable: boolean;
+  accountsError: boolean;
+  accountsRetrying: boolean;
+  onRetryAccounts: () => void;
   viewer: AuthenticatedViewer;
   theme: ThemeMode;
   setTheme: (theme: ThemeMode) => void;
@@ -2055,6 +3026,9 @@ function SettingsView({
   setExternalImages: (value: boolean) => void;
   onBack: () => void;
   onSignOut: () => void;
+  pendingConnectionAction: string | null;
+  onConnect: (provider: ProviderSource) => void;
+  onDisconnect: (account: MailAccount) => void;
 }) {
   const sections = [
     ["general", "General", Settings],
@@ -2086,6 +3060,18 @@ function SettingsView({
 
       <section className="settings-content">
         <div className="settings-inner">
+          {accountsError ? (
+            <QueryErrorNotice
+              title="Accounts couldn’t be refreshed"
+              description={
+                accountsAvailable
+                  ? "Showing the accounts that were already loaded."
+                  : "Connected mail accounts are temporarily unavailable."
+              }
+              retrying={accountsRetrying}
+              onRetry={onRetryAccounts}
+            />
+          ) : null}
           {section === "general" ? (
             <>
               <SettingsHeader
@@ -2115,11 +3101,6 @@ function SettingsView({
                     ]}
                   />
                 </SettingRow>
-                <SettingRow label="Language" description="Interface language only; message content is untouched.">
-                  <button type="button" className="value-button">
-                    English <ChevronDown size={15} />
-                  </button>
-                </SettingRow>
               </SettingsGroup>
             </>
           ) : null}
@@ -2128,12 +3109,9 @@ function SettingsView({
             <>
               <SettingsHeader
                 title="Mail"
-                description="Control conversation layout, remote content, and your signature."
+                description="Control how remote message content is displayed."
               />
               <SettingsGroup title="Reading">
-                <SettingRow label="Conversation view" description="Group replies into a single thread.">
-                  <Toggle checked label="Conversation view" />
-                </SettingRow>
                 <SettingRow
                   label="External images"
                   description="Hidden by default to reduce tracking."
@@ -2145,12 +3123,6 @@ function SettingsView({
                   />
                 </SettingRow>
               </SettingsGroup>
-              <SettingsGroup title="Writing">
-                <label className="signature-field">
-                  <span>Signature</span>
-                  <textarea defaultValue={"—\nSent from my private communication hub"} />
-                </label>
-              </SettingsGroup>
             </>
           ) : null}
 
@@ -2161,21 +3133,64 @@ function SettingsView({
                 description="Connected services stay separate and can be revoked independently."
               />
               <SettingsGroup title="Mail providers">
-                {accounts.map((account) => (
-                  <div className="connected-row" key={account.id}>
-                    <ProviderMark provider={account.provider} />
-                    <span>
-                      <strong>{providerLabels[account.provider]}</strong>
-                      <small>{account.address}</small>
-                    </span>
-                    <span className="connected-status">
-                      <i /> Demo data
-                    </span>
-                    <button type="button" disabled title="Real mailbox connections are not implemented">
-                      Manage
-                    </button>
-                  </div>
-                ))}
+                {accounts.length ? (
+                  accounts.map((account) => (
+                    <div className="connected-row" key={account.id}>
+                      <ProviderMark provider={account.provider} />
+                      <span>
+                        <strong>{providerLabels[account.provider]}</strong>
+                        <small>{account.address}</small>
+                      </span>
+                      <span className="connected-status">
+                        <i /> Connected
+                      </span>
+                      <button
+                        type="button"
+                        disabled={Boolean(pendingConnectionAction)}
+                        onClick={() => onDisconnect(account)}
+                      >
+                        {pendingConnectionAction === `disconnect:${account.id}`
+                          ? "Disconnecting…"
+                          : "Disconnect"}
+                      </button>
+                    </div>
+                  ))
+                ) : accountsAvailable ? (
+                  <p>No mailboxes are connected yet.</p>
+                ) : null}
+              </SettingsGroup>
+              <SettingsGroup title="Connect a mailbox">
+                {(["gmail", "outlook", "zoho"] as const).map(
+                  (mailProvider) => {
+                    const connectedCount = accounts.filter(
+                      (account) => account.provider === mailProvider,
+                    ).length;
+                    return (
+                      <div className="connected-row" key={mailProvider}>
+                        <ProviderMark provider={mailProvider} />
+                        <span>
+                          <strong>{providerLabels[mailProvider]}</strong>
+                          <small>
+                            {connectedCount
+                              ? `${connectedCount} mailbox${connectedCount === 1 ? "" : "es"} connected`
+                              : "Connect with OAuth"}
+                          </small>
+                        </span>
+                        <button
+                          type="button"
+                          disabled={Boolean(pendingConnectionAction)}
+                          onClick={() => onConnect(mailProvider)}
+                        >
+                          {pendingConnectionAction === `connect:${mailProvider}`
+                            ? "Opening…"
+                            : connectedCount
+                              ? "Add account"
+                              : "Connect"}
+                        </button>
+                      </div>
+                    );
+                  },
+                )}
               </SettingsGroup>
               <SettingsGroup title="Login identities">
                 <div className="connected-row">

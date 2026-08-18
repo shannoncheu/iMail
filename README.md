@@ -1,109 +1,72 @@
 # iMail
 
-iMail 是一个面向个人使用的多账号邮件工作台。目前仓库已经加入 GitHub 身份登录、PostgreSQL 会话和 OAuth 临时事务的基础代码，但邮件内容仍来自浏览器里的模拟数据。
+iMail 是一个自托管的个人多邮箱工作台，把 Gmail、Outlook.com 和 Zoho Mail 放在同一套界面里处理。它通过各家的 OAuth 和官方 API 读写邮件，不接管投递，也不实现 SMTP、IMAP、POP3 或垃圾邮件过滤。
 
-先把边界说清楚：这份代码不会自动连接数据库，也不包含任何可用的 OAuth 密钥。完成环境变量配置并执行数据库迁移后，GitHub 登录链路才会工作。Gmail、Outlook.com 和 Zoho Mail 的真实授权与邮件适配器尚未实现，因此现在仍不能读取或发送真实邮件。
+仓库中的真实邮件链路已经接通，包括三家适配器、同源 BFF、浏览器端 `ApiMailProvider`、账号连接与断开、分页、附件和 HTML 正文隔离。不过，这个仓库没有附带 Neon 数据库、OAuth Secret、生产域名或有效的 Sites `project_id`，也没有在真实生产凭据下完成端到端验证。这里的“已实现”指代码和自动测试已经覆盖，不等于线上环境已经可用。
 
-iMail 不是邮件服务器，也不实现 SMTP、IMAP、POP3、投递或垃圾邮件过滤。
+## 功能现状
 
-## 当前状态
-
-| 部分 | 现状 |
+| 模块 | 当前实现 |
 | --- | --- |
-| 身份登录 | 通过 GitHub OAuth 验证唯一的所有者身份，按 GitHub 不可变数字用户 ID 白名单放行 |
-| 会话 | 使用 PostgreSQL 保存会话摘要、有效期和吊销状态；浏览器只保存不透明的 HttpOnly Cookie |
-| OAuth 临时事务 | `state`、PKCE 和一次性事务保存在 PostgreSQL 中，登录回调消费后即失效 |
-| 邮件数据 | 仍由浏览器内的 `MockMailProvider` 提供，刷新页面后恢复 |
-| 真实邮箱接入 | Gmail、Outlook.com、Zoho Mail 的服务端注册位已经预留，但适配器均未配置，调用时会明确失败 |
-| 部署 | 仓库只提供代码和构建配置，不代表已经配置数据库、密钥或线上环境 |
+| 所有者登录 | GitHub OAuth；按不可变的 GitHub 数字用户 ID 白名单放行，不申请仓库权限 |
+| 邮箱连接 | Gmail、Outlook.com、Zoho Mail 的 Authorization Code + PKCE；要求 refresh token |
+| 多账号读取 | 账号、系统文件夹、邮件列表、搜索、详情和游标分页；“全部账号”最多 5 个连接、单页最多 25 封，单个 provider 故障会显示部分结果 |
+| 写操作 | 发送、保存及重新编辑草稿、回复、转发、归档、移入/恢复垃圾箱、已读和星标 |
+| 附件 | 写信时选择真实文件并转为 Base64；最多 10 个、单个及合计均不超过 5 MiB；下载走同源代理 |
+| HTML 邮件 | 服务端允许列表净化、同源 `sandbox` iframe、CSP；外部图片默认关闭，用户明确开启后只允许 HTTPS 图片 |
+| 浏览器边界 | UI 只访问 `/api/mail/*`；供应商 token、Client Secret 和原始 API 地址不进入客户端 |
+| 会话与凭据 | PostgreSQL 保存会话摘要和加密后的邮箱凭据；支持 active/previous 两版 token 加密密钥 |
+| 请求保护 | 精确 Origin、Fetch Metadata、CSRF、输入大小限制和持久化限流 |
+| 账号断开 | Gmail、Zoho 先尝试上游撤销；失败会保留待撤销凭据并由维护任务重试；Outlook 当前只做本地断开 |
+| 运维入口 | Cloudflare Cron `scheduled()` 和带 Bearer Secret 的备用维护端点；清理过期记录并补偿待撤销连接 |
+| 生产状态 | 未配置真实 Neon、OAuth Secret、Sites 项目、Cron、监控，也没有三家邮箱的生产 E2E 记录 |
 
-GitHub 只承担登录身份验证。授权请求不申请仓库权限；回调取得的 access token 只用于调用 GitHub `/user` 读取数字用户 ID 和展示信息，完成校验后立即吊销并丢弃，不写入数据库。
+三家适配器实现的是同一组领域能力，供应商差异留在服务端：
 
-## 可以体验的内容
+| 能力 | Gmail | Outlook.com | Zoho Mail |
+| --- | --- | --- | --- |
+| OAuth 连接与自动刷新 | 已实现 | 已实现 | 已实现 |
+| 文件夹、列表、搜索、分页 | 已实现 | 已实现；“已加星标”视图不支持同时搜索 | 已实现 |
+| 会话正文与附件读取 | 已实现 | 已实现 | 已实现 |
+| 发送、草稿、回复、转发 | 已实现 | 已实现 | 已实现 |
+| 归档、垃圾箱、已读、星标 | 已实现 | 已实现 | 已实现 |
+| 断开时上游撤销 | 撤销并支持后台重试 | 无单 refresh token 撤销端点，只清除本地凭据 | 撤销并支持后台重试 |
+| 特别说明 | 保留 Gmail 标签语义 | 使用 Microsoft Graph；租户由配置决定 | Accounts 与 Mail API 必须属于同一受支持数据中心 |
 
-- Gmail、Outlook.com 和 Zoho Mail 三种来源的模拟账号与邮件
-- 桌面三栏布局和移动端单栏导航
-- 收件箱、已加星标、已发送、草稿、归档和垃圾箱界面
-- 邮件列表虚拟滚动、搜索和来源筛选
-- 会话阅读、回复、转发和附件展示
-- 写信、保存草稿、归档、删除、已读和星标等交互
-- 浅色、深色和跟随系统主题
-- 三种桌面信息密度、键盘操作和减少动态效果设置
-
-邮件操作目前都是演示行为：
-
-| 界面操作 | 当前实际行为 |
-| --- | --- |
-| 切换账号或邮件来源 | 筛选本地模拟数据 |
-| 搜索和读取邮件 | 在浏览器内查询静态数据 |
-| 归档、删除、标记已读或加星 | 修改 `MockMailProvider` 的内存状态，刷新页面后恢复 |
-| 发送、回复、转发和保存草稿 | 在当前浏览器会话中修改模拟邮件，不会发出真实邮件 |
-| 连接邮箱账号 | 真实 Provider 尚未实现，不会回退到模拟 Provider |
-
-## 代码结构
-
-当前有两条互相独立的运行路径：
+## 运行方式
 
 ```text
-身份与会话
 浏览器
   -> Cloudflare Worker / vinext App Router
-     -> 同源认证路由
-        -> GitHub OAuth（只验证身份）
-        -> Neon PostgreSQL（会话、OAuth 临时事务）
-
-邮件界面
-CommunicationHub（客户端组件）
-  -> TanStack Query
-     -> MockMailProvider
-        -> src/mocks/mail.ts
+     -> GitHub 登录与应用会话
+     -> /api/mail/* 同源 BFF
+        -> MailService
+           -> server-only Provider 注册表
+              -> Gmail API / Microsoft Graph / Zoho Mail API
+     -> Neon PostgreSQL
+        -> 身份、会话、OAuth 临时事务、邮箱连接、草稿意图、15 分钟加密分页状态、限流和安全事件
 ```
 
-真实邮件接入必须走服务端边界：
+浏览器端的 `createMailProvider(csrfToken)` 始终创建 `ApiMailProvider`。`MockMailProvider` 仍然显式导出，供自动测试和独立开发使用，但生产路径不会在配置失败时退回模拟数据。
 
-```text
-浏览器
-  -> 同源 BFF
-     -> 鉴权与应用服务
-        -> server-only Provider 注册表
-           -> Gmail / Outlook / Zoho 适配器（尚未实现）
-```
+数据库不长期保存邮件正文、附件或供应商搜索索引。服务端分页（包括单账号和“全部账号”视图）会把未消费的列表摘要和 provider cursor 加密后暂存 15 分钟，正文和附件字节不进入该状态。为了让关闭后的回复或转发草稿仍能按原语义发送，数据库只保存 owner、邮箱连接、供应商草稿 ID、动作类型和原邮件 ID 的绑定，不保存草稿正文；邮件内容仍按需从供应商读取，客户端查询缓存只存在于当前页面内存中。
 
-`worker/index.ts` 是 Worker 入口，并把运行时绑定放进当前请求的服务端上下文。普通请求交给 vinext；`/_vinext/image` 由 Cloudflare 的资源和图片绑定处理。项目使用 Next.js App Router 的目录和组件模型，但构建链路是 vinext、Vite、Cloudflare Worker 和 OpenAI Sites，不是标准的 `next build` / `next start` 自托管方案。
+详细的数据流、路由和表结构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
-主要代码位置：
+## 快速开始
 
-| 路径 | 内容 |
-| --- | --- |
-| [`app/communication-hub.tsx`](app/communication-hub.tsx) | 邮件工作台界面与模拟交互 |
-| [`app/login-view.tsx`](app/login-view.tsx) | 未登录或认证未配置时的入口 |
-| [`src/server/auth/`](src/server/auth/) | 所有者身份、OAuth 临时事务和会话数据访问 |
-| [`src/server/security/`](src/server/security/) | PKCE、加密、Cookie、Origin 和 CSRF 校验 |
-| [`src/server/db/neon.ts`](src/server/db/neon.ts) | Neon PostgreSQL HTTP 查询入口 |
-| [`db/migrations/0001_auth_foundation.sql`](db/migrations/0001_auth_foundation.sql) | 认证、会话、连接和安全事件表结构 |
-| [`src/server/mail/provider-registry.ts`](src/server/mail/provider-registry.ts) | 仅服务端可导入的真实邮件 Provider 注册边界 |
-| [`src/providers/mail/MockMailProvider.ts`](src/providers/mail/MockMailProvider.ts) | 当前唯一可用的邮件 Provider，数据只在内存中 |
-| [`worker/index.ts`](worker/index.ts) | Cloudflare Worker 入口 |
-| [`vite.config.ts`](vite.config.ts) | vinext、Vite、Sites 和 Cloudflare 构建配置 |
-
-更完整的边界说明见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
-
-## 本地运行
-
-只运行构建、测试或查看“认证未配置”页面时，需要：
+### 运行环境
 
 - Node.js 22.13 或更高版本
 - npm
-- Linux 或 WSL2
+- Neon PostgreSQL
+- GitHub OAuth App
+- 至少一家邮箱供应商的 OAuth Client
+- Bash 和 GNU 工具；完整构建流程建议使用 Linux 或 WSL2
 
-要走通 GitHub 登录，还需要：
+项目使用 vinext、Vite 和 Cloudflare Worker 构建，不是标准的 `next build` 自托管项目。
 
-- 一个 Neon PostgreSQL 数据库
-- 一个 GitHub OAuth App
-
-仓库现有的 npm 脚本使用 Bash 和 GNU 工具。`build` 依赖 GNU `timeout`；`install:ci` 还依赖 `flock`、`curl`、`sha256sum` 和 Linux 的 `/proc`。原生 Windows PowerShell/CMD 目前不在支持范围内，`install:ci` 也不能直接在 macOS 上运行。
-
-### 1. 安装依赖
+### 1. 安装
 
 ```bash
 git clone https://github.com/shannoncheu/iMail.git
@@ -111,108 +74,85 @@ cd iMail
 npm ci
 ```
 
-### 2. 准备 GitHub OAuth App
+### 2. 准备本地配置
 
-在 GitHub OAuth App 中填写：
-
-- Homepage URL：与 `APP_URL` 完全一致
-- Authorization callback URL：`APP_URL` 后加 `/api/auth/github/callback`
-
-例如本地开发使用：
-
-```text
-Homepage URL: http://localhost:3000
-Authorization callback URL: http://localhost:3000/api/auth/github/callback
+```bash
+cp .env.example .dev.vars
 ```
 
-登录只读取公开身份，不需要配置 OAuth scope。建议为 iMail 单独创建 OAuth App，不要复用曾申请过 `repo` 等权限的应用；回调一旦发现非空 scope，会吊销该 token 并拒绝登录。`ALLOWED_GITHUB_IDS` 必须填写 GitHub 的数字用户 ID，不要填写用户名；用户名可以修改，数字 ID 才是访问控制依据。
-
-### 3. 配置环境变量
-
-本地开发先把 [`.env.example`](.env.example) 复制为 `.dev.vars`；这个文件已被 Git 忽略，Cloudflare 本地运行和迁移脚本都会读取它。线上环境则使用 Worker Secret。至少需要：
+至少填写以下核心变量：
 
 ```dotenv
 APP_URL=http://localhost:3000
 DATABASE_URL=postgresql://...
-SESSION_SECRET=至少 32 个字符的随机值
-TOKEN_ENCRYPTION_KEY=32 个随机字节的 base64url 编码
+SESSION_SECRET=至少32个字符的独立随机值
+TOKEN_ENCRYPTION_KEY=32个随机字节的base64url编码
+TOKEN_ENCRYPTION_KEY_VERSION=1
 GITHUB_CLIENT_ID=...
 GITHUB_CLIENT_SECRET=...
 ALLOWED_GITHUB_IDS=12345678
 ```
 
-`SESSION_SECRET` 和 `TOKEN_ENCRYPTION_KEY` 必须使用不同的随机值。生产环境应通过部署平台的 Secret Store 注入，不要把真实值提交到仓库。
+`ALLOWED_GITHUB_IDS` 填 GitHub 数字用户 ID，不是用户名。`SESSION_SECRET` 和 `TOKEN_ENCRYPTION_KEY` 必须使用不同的随机值。
 
-### 4. 执行迁移并启动
+再按需要配置邮箱：
+
+| 邮箱 | 必需变量 |
+| --- | --- |
+| Gmail | `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET` |
+| Outlook.com | `MICROSOFT_CLIENT_ID`、`MICROSOFT_CLIENT_SECRET`、可选的 `MICROSOFT_TENANT` |
+| Zoho Mail | `ZOHO_CLIENT_ID`、`ZOHO_CLIENT_SECRET`、与数据中心匹配的两个 Zoho Base URL |
+
+四个 OAuth 回调地址、供应商权限和 Zoho 数据中心配置容易出错，完整步骤以 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 为准。
+
+### 3. 迁移数据库并启动
 
 ```bash
 npm run db:migrate
 npm run dev
 ```
 
-迁移不会在应用启动时自动执行。它会创建 `owners`、`owner_identities`、`oauth_transactions`、`sessions`、`mail_connections` 和 `security_events` 等表。
+迁移必须显式执行，应用启动时不会自动建表。登录后进入 Settings → Accounts，选择 Gmail、Outlook 或 Zoho 发起连接。没有配置对应 OAuth Client 时，连接端点会明确返回未配置错误。
 
-当前 Worker 数据库访问使用 `@neondatabase/serverless` 的 Neon HTTP driver，因此 `DATABASE_URL` 应来自 Neon PostgreSQL。OpenAI Sites 的 `.openai/hosting.json` 目前只能声明它支持的资源，不能在其中配置 Cloudflare Hyperdrive；如果以后改用 Hyperdrive，需要另外调整 Cloudflare 绑定和数据库访问层。
-
-仓库本身没有连接任何真实数据库，也没有保存任何真实密钥。仅修改 `.env.example` 不会建立连接。
+本地 GitHub 与邮箱 OAuth App 的回调 Origin 必须和 `APP_URL` 完全一致。生产环境还需要 HTTPS 域名、Sites 项目、Secret、Cron、监控和备份，请不要直接照搬本地配置上线。
 
 ## 常用命令
 
-| 命令 | 说明 |
+| 命令 | 用途 |
 | --- | --- |
-| `npm run dev` | 启动 Vite 和本地 Cloudflare 开发环境 |
-| `npm run db:migrate` | 使用 `DATABASE_URL` 执行认证基础迁移 |
-| `npm run lint` | 运行 ESLint |
-| `npm run build` | 执行 vinext 构建并检查 Sites Worker 产物 |
-| `npm test` | 构建后运行安全边界、Provider 行为和 Worker HTML 测试 |
-| `npm run install:ci` | 在 Sites/Linux 环境中按锁文件安装依赖 |
+| `npm run dev` | 启动本地 Vite/Cloudflare 开发环境 |
+| `npm run db:migrate` | 对 `DATABASE_URL` 执行尚未应用的迁移 |
+| `npm run typecheck` | TypeScript 类型检查 |
+| `npm run lint` | ESLint 检查 |
+| `npm test` | 构建后运行认证、邮件适配器、BFF、安全和维护任务测试 |
+| `npm run build` | 构建并校验 Sites Worker 产物 |
+| `npm run validate:artifact` | 单独检查发布产物结构 |
 
-测试覆盖 PKCE 与加密辅助函数、Cookie 策略、Origin/Fetch Metadata/CSRF 校验、服务端 Provider 边界、Mock Provider 行为和构建后 Worker HTML 冒烟检查。测试不会替你验证真实 GitHub OAuth App、真实 Neon 数据库或任何邮箱供应商账号。
+自动测试使用模拟的数据库查询和供应商 HTTP 响应，不会连接真实 Neon、GitHub 或邮箱账号。
 
-## 环境变量
+## 主要目录
 
-| 变量 | 当前用途 |
+| 路径 | 职责 |
 | --- | --- |
-| `APP_URL` | 固定应用 Origin，并生成精确的 GitHub 回调地址 |
-| `DATABASE_URL` | Neon PostgreSQL 连接地址；认证与会话代码使用 |
-| `SESSION_SECRET` | 派生会话摘要和 CSRF 校验值 |
-| `TOKEN_ENCRYPTION_KEY` | 加密 OAuth 临时事务中的敏感字段；要求 32 字节 base64url |
-| `GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET` | GitHub 身份登录 |
-| `ALLOWED_GITHUB_IDS` | 允许登录的 GitHub 不可变数字用户 ID，逗号分隔；空值时拒绝登录 |
-| `USE_MOCK_DATA` | 已预留；邮件界面当前仍固定使用 Mock Provider |
-| `GOOGLE_*`、`MICROSOFT_*`、`ZOHO_*` | 为后续真实邮箱 OAuth 预留，当前未使用 |
-| 其他 `ALLOWED_*` | 为后续身份来源预留，当前未使用 |
+| [`app/communication-hub.tsx`](app/communication-hub.tsx) | 邮件工作台、OAuth 账号管理、分页、正文与附件交互 |
+| [`app/api/mail/`](app/api/mail/) | 浏览器访问的同源邮件 BFF |
+| [`src/providers/mail/`](src/providers/mail/) | 稳定的 `MailProvider` 接口、`ApiMailProvider` 和显式 Mock |
+| [`src/server/mail/`](src/server/mail/) | OAuth、应用服务、Provider 工厂、三家适配器、内容净化和凭据管理 |
+| [`src/server/auth/`](src/server/auth/) | GitHub 身份、应用会话和 OAuth 临时事务 |
+| [`src/server/security/`](src/server/security/) | 加密、Cookie、CSRF、同源校验、限流和响应头 |
+| [`db/migrations/`](db/migrations/) | PostgreSQL 迁移 |
+| [`worker/index.ts`](worker/index.ts) | Worker 请求入口与 Cron `scheduled()` |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Neon、OAuth、Sites、Cron、轮换、回滚和上线检查 |
 
-## 已落地的安全边界
+## 上线前仍要完成
 
-- 登录发起请求必须是同源 POST，并检查 `Origin` 和 Fetch Metadata。
-- OAuth 使用短时一次性事务、随机 `state` 和 PKCE S256；回调地址由可信的 `APP_URL` 固定生成。
-- 所有者白名单使用 GitHub 数字用户 ID，并在白名单为空或不匹配时拒绝登录。
-- GitHub access token 不持久化，仅用于读取 `/user`，随后通过 GitHub API 吊销并丢弃。
-- 会话 Cookie 为不透明随机值，数据库只保存摘要；HTTPS 下使用 `Secure`、`HttpOnly`、`SameSite=Strict`。
-- 修改状态的认证请求同时校验精确 Origin、Fetch Metadata 和 CSRF token。
-- Worker 为页面和 API 统一补充防嵌入、MIME 嗅探、权限策略和 Referrer 响应头；HTTPS 响应包含 HSTS。
-- 真实邮件 Provider 注册表只能在服务端导入；未知或尚未配置的 Provider 会直接报错，不会静默切换到模拟数据。
+当前代码不能替代真实环境验收。至少还要完成：
 
-这些措施不等于项目已经可以安全处理真实邮箱。邮件 HTML 隔离、附件代理、供应商令牌刷新与并发控制、真实 Provider 的权限范围和端到端安全测试仍未完成。
+- 创建并迁移真实 Neon 数据库；
+- 创建四个 OAuth 应用并把 Secret 注入部署平台；
+- 为 `.openai/hosting.json` 填入真实 Sites `project_id`，配置域名和 HTTPS；
+- 用专用测试账号走通 GitHub 登录和三家邮箱的连接、刷新、读写、附件、HTML 与断开流程；
+- 配置 Cron、监控、告警、备份，并演练恢复和密钥轮换；
+- 确认 Google restricted scope 的验证状态满足实际发布范围。
 
-## 后续工作
-
-- [x] 邮件工作台界面和模拟数据
-- [x] 与供应商无关的 `MailProvider` 接口
-- [x] GitHub 所有者身份登录和数字 ID 白名单
-- [x] PostgreSQL 会话、OAuth 临时事务和安全事件迁移
-- [x] Origin、Fetch Metadata、CSRF 和 Cookie 安全策略
-- [x] 真实邮件 Provider 的 server-only 注册边界
-- [ ] 在目标环境配置并迁移真实数据库与密钥
-- [ ] Gmail OAuth 与邮件适配器
-- [ ] Outlook.com OAuth 与邮件适配器
-- [ ] Zoho Mail OAuth 与邮件适配器
-- [ ] 把邮件查询与写操作迁移到同源服务端应用层
-- [ ] 邮件 HTML 隔离、附件代理和完整安全测试
-- [ ] 登录入口的边缘限流与过期认证记录清理任务
-- [ ] 生产部署、监控、备份与密钥轮换文档
-
-在真实 Provider 和邮件内容安全边界完成之前，请只用模拟邮件验证界面与交互，不要把它当作可用的私人邮箱入口。
-
-安全问题请参考 [`SECURITY.md`](SECURITY.md)。
+安全边界和剩余验证项见 [`SECURITY.md`](SECURITY.md)。部署时按 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 操作，不要把构建通过或单元测试通过写成“已经生产上线”。

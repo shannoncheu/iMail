@@ -8,11 +8,13 @@ import type {
   ServerMailProviderContext,
   ServerMailProviderRegistry,
 } from "./types";
+import { ConfigurationError } from "../config";
+import { createProductionMailProviderFactory } from "./provider-factory";
 
 const providerRegistry: ServerMailProviderRegistry = Object.freeze({
-  gmail: null,
-  outlook: null,
-  zoho: null,
+  gmail: createProductionMailProviderFactory("gmail"),
+  outlook: createProductionMailProviderFactory("outlook"),
+  zoho: createProductionMailProviderFactory("zoho"),
 });
 
 export class UnknownMailProviderError extends Error {
@@ -55,5 +57,12 @@ export async function resolveServerMailProvider(
     throw new MailProviderNotConfiguredError(provider);
   }
 
-  return factory(context);
+  try {
+    return await factory(context);
+  } catch (error) {
+    if (error instanceof ConfigurationError) {
+      throw new MailProviderNotConfiguredError(provider);
+    }
+    throw error;
+  }
 }

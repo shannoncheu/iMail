@@ -164,6 +164,12 @@ export interface RotateOwnerSessionInput
   previousTokenDigest: string;
 }
 
+export interface RotateOwnerSessionByIdInput
+  extends Omit<CreateOwnerSessionInput, "ownerId" | "identityId"> {
+  previousSessionId: string;
+  allowedGithubIds: readonly string[];
+}
+
 export interface RecordSecurityEventInput {
   id?: string;
   ownerId?: string | null;

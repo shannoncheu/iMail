@@ -14,6 +14,14 @@ export interface ServerMailProviderContext {
   ownerId: string;
 }
 
+export interface ServerMailAccessTokenRequest {
+  forceRefresh?: boolean;
+}
+
+export type ServerMailAccessTokenProvider = (
+  request?: Readonly<ServerMailAccessTokenRequest>,
+) => Promise<string>;
+
 export type ServerMailProviderFactory = (
   context: Readonly<ServerMailProviderContext>,
 ) => MailProvider | Promise<MailProvider>;

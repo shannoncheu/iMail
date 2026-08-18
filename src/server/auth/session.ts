@@ -24,6 +24,7 @@ export type SessionRepository = Pick<
   | "createOwnerSession"
   | "findSessionByDigest"
   | "revokeSessionByDigest"
+  | "rotateOwnerSessionById"
 >;
 
 export interface AuthenticatedSession extends AuthenticatedPageSession {
@@ -126,6 +127,27 @@ export async function authenticateCookieHeader({
       avatarUrl: githubIdentity.avatarUrl,
     },
   };
+}
+
+export async function rotateOwnerSessionFromId({
+  config,
+  previousSessionId,
+  repository = repositoryFor(config),
+}: {
+  config: AuthConfig;
+  previousSessionId: string;
+  repository?: SessionRepository;
+}): Promise<{ rawToken: string; session: OwnerSession }> {
+  const rawToken = randomBase64Url(32);
+  const tokenDigest = await sessionDigest(config, rawToken);
+  const session = await repository.rotateOwnerSessionById({
+    previousSessionId,
+    allowedGithubIds: [...config.github.allowedIds],
+    tokenDigest,
+    expiresAt: new Date(Date.now() + SESSION_LIFETIME_MS),
+  });
+  if (!session) throw new Error("Owner session could not be rotated");
+  return { rawToken, session };
 }
 
 export async function authenticateRequest({
