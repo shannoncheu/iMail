@@ -480,6 +480,8 @@ select:focus-visible,
 .compose-attachment strong { color: var(--text-primary); font-size: 12px; }
 .compose-attachment small { color: var(--text-tertiary); font-size: 11px; }
 .compose-attachment button { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 6px; color: var(--text-secondary); background: transparent; }
+.compose-error { display: flex; align-items: center; gap: 7px; margin: 0 16px 8px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border-default)); border-radius: 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface-primary)); font-size: 11px; line-height: 16px; }
+.compose-error svg { flex: 0 0 auto; }
 .compose-footer { min-height: 58px; justify-content: space-between; gap: 12px; padding: 8px 14px; border-top: 1px solid var(--border-subtle); }
 .compose-footer > div { gap: 4px; }
 .send-button, .attach-button { min-height: 38px; border-radius: 8px; }
@@ -492,9 +494,11 @@ select:focus-visible,
 
 .toast { position: fixed; z-index: 160; right: 22px; bottom: 20px; min-height: 46px; gap: 9px; padding: 7px 8px 7px 13px; border: 1px solid var(--border-default); border-radius: 10px; color: var(--text-primary); background: var(--surface-raised); box-shadow: var(--shadow-mid); }
 .toast > svg { color: var(--success); }
+.toast.is-error > svg { color: var(--danger); }
 .toast > span { font-size: 12px; }
 .toast > button:not(.toast-close) { padding: 6px 8px; border-radius: 6px; color: var(--accent); background: var(--accent-soft); font-size: 11px; font-weight: 600; }
 .toast-close { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 6px; color: var(--text-secondary); background: transparent; }
+.icon-button:disabled, .row-star:disabled, .swipe-actions button:disabled, .attach-button:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .settings-heading-mobile { color: var(--text-primary); font-size: 15px; font-weight: 600; text-align: center; }
 .settings-page { grid-column: 1 / -1; grid-row: 2; display: grid; min-width: 0; min-height: 0; grid-template-columns: 250px minmax(0, 1fr); background: var(--surface-primary); }

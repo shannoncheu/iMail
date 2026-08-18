@@ -16,6 +16,7 @@ export type {
   MailFolderId,
   MailProvider,
   MailThread,
+  MessageLocation,
   ProviderSource,
   ThreadMessage,
 } from "./MailProvider";
