@@ -2,9 +2,9 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Private Communication Hub",
+  title: "iMail — Private inbox",
   description:
-    "A private, provider-neutral workspace for personal mail communication.",
+    "A private workspace for Gmail, Outlook, and Zoho Mail.",
   other: {
     "codex-preview": "development",
   },
@@ -17,8 +17,8 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   colorScheme: "light dark",
   themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#f4f5f2" },
-    { media: "(prefers-color-scheme: dark)", color: "#111411" },
+    { media: "(prefers-color-scheme: light)", color: "#f6f8fc" },
+    { media: "(prefers-color-scheme: dark)", color: "#0f1115" },
   ],
   width: "device-width",
   initialScale: 1,
@@ -35,3 +35,4 @@ export default function RootLayout({
     </html>
   );
 }
+

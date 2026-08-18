@@ -54,6 +54,7 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
+  type Ref,
 } from "react";
 import {
   createMailProvider,
@@ -208,6 +209,28 @@ const MAX_COMPOSE_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 5 * 1_024 * 1_024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 5 * 1_024 * 1_024;
 
+const CONTROL_SPRING = {
+  type: "spring" as const,
+  stiffness: 460,
+  damping: 32,
+  mass: 0.72,
+};
+
+const SURFACE_SPRING = {
+  type: "spring" as const,
+  stiffness: 360,
+  damping: 30,
+  mass: 0.82,
+};
+
+function controlMotion(reduceMotion: boolean | null, tapScale = 0.96) {
+  return {
+    whileHover: reduceMotion ? undefined : { y: -1 },
+    whileTap: reduceMotion ? undefined : { y: 0, scale: tapScale },
+    transition: reduceMotion ? { duration: 0 } : CONTROL_SPRING,
+  };
+}
+
 function formatFileSize(sizeBytes: number) {
   if (sizeBytes < 1_024) return `${sizeBytes} B`;
   if (sizeBytes < 1_024 * 1_024) return `${Math.ceil(sizeBytes / 1_024)} KB`;
@@ -320,6 +343,11 @@ function Hub({
   const mailActionPendingRef = useRef(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const composeButtonRef = useRef<HTMLButtonElement>(null);
+  const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const profileButtonRef = useRef<HTMLButtonElement>(null);
+  const accountMenuWrapRef = useRef<HTMLDivElement>(null);
+  const accountPopoverRef = useRef<HTMLDivElement>(null);
   const composeReturnFocusRef = useRef<HTMLElement | null>(null);
   const composeModeRef = useRef<ComposeMode | null>(null);
   const loadingDraftIdRef = useRef<string | null>(null);
@@ -354,6 +382,20 @@ function Hub({
     const returnTarget = composeReturnFocusRef.current;
     if (returnTarget?.isConnected) returnTarget.focus();
     else composeButtonRef.current?.focus();
+  }, []);
+
+  const closeSidebar = useCallback((restoreFocus = false) => {
+    setSidebarOpen(false);
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => mobileMenuButtonRef.current?.focus());
+    }
+  }, []);
+
+  const closeAccountMenu = useCallback((restoreFocus = false) => {
+    setAccountMenuOpen(false);
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => profileButtonRef.current?.focus());
+    }
   }, []);
 
   const accountsQuery = useQuery({
@@ -576,6 +618,58 @@ function Hub({
     openCompose,
     outlookStarredSearchDisabled,
   ]);
+
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+
+    const focusFrame = window.requestAnimationFrame(() => {
+      accountPopoverRef.current
+        ?.querySelector<HTMLButtonElement>("button:not([disabled])")
+        ?.focus();
+    });
+    const handlePointerDown = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !accountMenuWrapRef.current?.contains(event.target)
+      ) {
+        closeAccountMenu();
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeAccountMenu(true);
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [accountMenuOpen, closeAccountMenu]);
+
+  useEffect(() => {
+    if (!sidebarOpen) return;
+
+    const focusFrame = window.requestAnimationFrame(() => {
+      sidebarRef.current
+        ?.querySelector<HTMLButtonElement>("button:not([disabled])")
+        ?.focus();
+    });
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeSidebar(true);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [closeSidebar, sidebarOpen]);
 
   const refreshMail = async () => {
     try {
@@ -985,7 +1079,7 @@ function Hub({
     setScope(nextScope);
     setScopeAccountId(nextAccountId);
     setSelectedIds(new Set());
-    setSidebarOpen(false);
+    closeSidebar(sidebarOpen);
     setMobilePane("list");
   };
 
@@ -1002,7 +1096,7 @@ function Hub({
     }
     setFolder(nextFolder);
     setSelectedIds(new Set());
-    setSidebarOpen(false);
+    closeSidebar(sidebarOpen);
     setMobilePane("list");
   };
 
@@ -1023,29 +1117,36 @@ function Hub({
       <header className="topbar">
         <div className="topbar-brand">
           <IconButton
+            buttonRef={mobileMenuButtonRef}
             className="mobile-menu-button"
             label={view === "settings" ? "Back to mail" : "Open navigation"}
+            ariaExpanded={view === "mail" ? sidebarOpen : undefined}
+            ariaControls={view === "mail" ? "mail-sidebar" : undefined}
             onClick={() => {
               if (view === "settings") setView("mail");
-              else setSidebarOpen(true);
+              else {
+                closeAccountMenu();
+                setSidebarOpen(true);
+              }
             }}
             icon={view === "settings" ? ArrowLeft : Menu}
           />
-          <button
+          <motion.button
             className="brand-button"
             type="button"
             onClick={() => {
               setView("mail");
               setMobilePane("list");
             }}
-            aria-label="Private Hub home"
+            aria-label="iMail home"
+            {...controlMotion(reduceMotion, 0.98)}
           >
             <span className="brand-mark" aria-hidden="true">
               <span />
               <i />
             </span>
-            <span className="brand-wordmark">Private Hub</span>
-          </button>
+            <span className="brand-wordmark">iMail</span>
+          </motion.button>
         </div>
 
         {view === "mail" ? (
@@ -1112,47 +1213,64 @@ function Hub({
             }}
             icon={Settings}
           />
-          <div className="account-menu-wrap">
-            <button
+          <div className="account-menu-wrap" ref={accountMenuWrapRef}>
+            <motion.button
+              ref={profileButtonRef}
               className="profile-button"
               type="button"
-              onClick={() => setAccountMenuOpen((open) => !open)}
+              onClick={() => {
+                closeSidebar();
+                setAccountMenuOpen((open) => !open);
+              }}
               aria-label="Open account menu"
               aria-expanded={accountMenuOpen}
+              aria-controls="account-popover"
+              {...controlMotion(reduceMotion)}
             >
               {initials(viewer.displayName || viewer.login)}
               <span className="presence-dot" />
-            </button>
+            </motion.button>
             <AnimatePresence>
               {accountMenuOpen ? (
                 <motion.div
+                  ref={accountPopoverRef}
+                  id="account-popover"
                   className="account-popover"
-                  initial={reduceMotion ? false : { opacity: 0, y: -4 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -4 }}
-                  transition={{ duration: reduceMotion ? 0 : 0.15 }}
+                  initial={
+                    reduceMotion ? false : { opacity: 0, y: -8, scale: 0.97 }
+                  }
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={
+                    reduceMotion
+                      ? { opacity: 0 }
+                      : { opacity: 0, y: -5, scale: 0.98 }
+                  }
+                  transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
+                  style={{ transformOrigin: "top right" }}
                 >
                   <div className="account-popover-head">
                     <strong>{viewer.displayName}</strong>
                     <span>@{viewer.login} · Owner access</span>
                   </div>
-                  <button
+                  <motion.button
                     type="button"
                     onClick={() => {
                       setView("settings");
                       setSettingsSection("security");
-                      setAccountMenuOpen(false);
+                      closeAccountMenu(true);
                     }}
+                    {...controlMotion(reduceMotion, 0.98)}
                   >
                     <ShieldCheck size={16} /> Security
-                  </button>
-                  <button
+                  </motion.button>
+                  <motion.button
                     type="button"
                     disabled={signingOut}
                     onClick={() => void signOut()}
+                    {...controlMotion(reduceMotion, 0.98)}
                   >
                     <LogOut size={16} /> {signingOut ? "Signing out…" : "Sign out"}
-                  </button>
+                  </motion.button>
                 </motion.div>
               ) : null}
             </AnimatePresence>
@@ -1166,18 +1284,27 @@ function Hub({
             className="sidebar-backdrop"
             aria-label="Close navigation"
             type="button"
-            onClick={() => setSidebarOpen(false)}
-            initial={{ opacity: 0 }}
+            onClick={() => closeSidebar(true)}
+            initial={reduceMotion ? false : { opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
+            transition={
+              reduceMotion
+                ? { duration: 0 }
+                : { duration: 0.18, ease: [0.22, 1, 0.36, 1] }
+            }
           />
         ) : null}
       </AnimatePresence>
 
       {view === "mail" ? (
         <>
-          <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`}>
-            <button
+          <aside
+            ref={sidebarRef}
+            id="mail-sidebar"
+            className={`sidebar ${sidebarOpen ? "is-open" : ""}`}
+          >
+            <motion.button
               ref={composeButtonRef}
               type="button"
               className="compose-primary"
@@ -1188,10 +1315,11 @@ function Hub({
                   : "Connect a mail account before composing"
               }
               onClick={() => openCompose("new")}
+              {...controlMotion(reduceMotion, 0.97)}
             >
               <PencilLine size={18} />
               <span>Compose</span>
-            </button>
+            </motion.button>
 
             <div className="sidebar-section" aria-label="Mail accounts">
               <p className="sidebar-label">Mail spaces</p>
@@ -1254,29 +1382,34 @@ function Hub({
                   (candidate) => candidate.id === item.id,
                 )?.count;
                 return (
-                  <button
+                  <motion.button
                     key={item.id}
                     type="button"
                     className={folder === item.id ? "is-active" : ""}
                     aria-current={folder === item.id ? "page" : undefined}
                     onClick={() => switchFolder(item.id)}
+                    {...controlMotion(reduceMotion, 0.98)}
                   >
                     <Icon size={17} aria-hidden="true" />
                     <span>{item.label}</span>
                     {count ? <small>{count}</small> : null}
-                  </button>
+                  </motion.button>
                 );
               })}
             </nav>
 
-            <button
+            <motion.button
               type="button"
               className="sidebar-settings"
-              onClick={() => setView("settings")}
+              onClick={() => {
+                closeSidebar(sidebarOpen);
+                setView("settings");
+              }}
+              {...controlMotion(reduceMotion, 0.98)}
             >
               <Settings size={17} />
               <span>Settings</span>
-            </button>
+            </motion.button>
           </aside>
 
           <main className="mail-workspace">
@@ -1446,7 +1579,7 @@ function Hub({
             />
           </main>
 
-          <button
+          <motion.button
             type="button"
             className="compose-fab"
             disabled={!accountsQuery.data?.length}
@@ -1459,9 +1592,10 @@ function Hub({
               if (accountsQuery.data?.length) openCompose("new");
             }}
             aria-label="Compose message"
+            {...controlMotion(reduceMotion, 0.92)}
           >
             <PencilLine size={21} />
-          </button>
+          </motion.button>
         </>
       ) : (
         <SettingsView
@@ -1531,9 +1665,14 @@ function Hub({
           <motion.div
             className={`toast ${toast.tone === "error" ? "is-error" : ""}`}
             role={toast.tone === "error" ? "alert" : "status"}
-            initial={reduceMotion ? false : { opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 8 }}
+            initial={reduceMotion ? false : { opacity: 0, y: 14, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={
+              reduceMotion
+                ? { opacity: 0 }
+                : { opacity: 0, y: 9, scale: 0.985 }
+            }
+            transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
           >
             {toast.tone === "error" ? (
               <AlertCircle size={17} />
@@ -1572,12 +1711,15 @@ function ScopeButton({
   active: boolean;
   onClick: () => void;
 }) {
+  const reduceMotion = useReducedMotion();
+
   return (
-    <button
+    <motion.button
       type="button"
       className={`scope-button ${active ? "is-active" : ""}`}
       onClick={onClick}
       aria-pressed={active}
+      {...controlMotion(reduceMotion, 0.98)}
     >
       {scope === "all" ? (
         <span className="all-mark" aria-hidden="true">
@@ -1593,7 +1735,7 @@ function ScopeButton({
         {account ? <small>{providerLabels[account.provider]}</small> : null}
       </span>
       {active ? <Check size={14} aria-hidden="true" /> : null}
-    </button>
+    </motion.button>
   );
 }
 
@@ -1694,6 +1836,7 @@ function MessageList({
   loadingMore: boolean;
   onLoadMore: () => void;
 }) {
+  const reduceMotion = useReducedMotion();
   const parentRef = useRef<HTMLDivElement>(null);
   const rowHeight =
     density === "compact" ? 58 : density === "relaxed" ? 78 : 68;
@@ -1783,7 +1926,13 @@ function MessageList({
     <div className="message-list-region">
       {retainedDataWarning}
       {partialDataWarning}
-      <div className="virtual-list" ref={parentRef}>
+      <motion.div
+        className="virtual-list"
+        ref={parentRef}
+        initial={reduceMotion ? false : { opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
+      >
         <div
           className="virtual-list-inner"
           style={{ height: virtualizer.getTotalSize() }}
@@ -1829,7 +1978,7 @@ function MessageList({
         ) : (
           <div className="list-end">You’re all caught up</div>
         )}
-      </div>
+      </motion.div>
     </div>
   );
 }
@@ -1861,41 +2010,71 @@ function MessageRow({
   onTrashAction: () => void;
   actionsDisabled: boolean;
 }) {
+  const reduceMotion = useReducedMotion();
   const [swipe, setSwipe] = useState(0);
-  const startX = useRef<number | null>(null);
+  const pointerStart = useRef<{
+    x: number;
+    y: number;
+    origin: number;
+    intent: "pending" | "horizontal" | "vertical";
+  } | null>(null);
 
   const pointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    startX.current = event.clientX;
+    pointerStart.current = {
+      x: event.clientX,
+      y: event.clientY,
+      origin: swipe,
+      intent: "pending",
+    };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
   const pointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (startX.current === null) return;
-    const delta = event.clientX - startX.current;
-    if (Math.abs(delta) > 12) {
-      setSwipe(Math.max(-96, Math.min(96, delta)));
+    const start = pointerStart.current;
+    if (!start) return;
+    const deltaX = event.clientX - start.x;
+    const deltaY = event.clientY - start.y;
+    if (
+      start.intent === "pending" &&
+      Math.max(Math.abs(deltaX), Math.abs(deltaY)) > 12
+    ) {
+      start.intent =
+        Math.abs(deltaX) > Math.abs(deltaY) ? "horizontal" : "vertical";
+    }
+    if (start.intent === "horizontal") {
+      setSwipe(Math.max(-96, Math.min(96, start.origin + deltaX)));
     }
   };
   const pointerUp = () => {
-    setSwipe((value) => (Math.abs(value) > 56 ? Math.sign(value) * 88 : 0));
-    startX.current = null;
+    if (pointerStart.current?.intent === "horizontal") {
+      setSwipe((value) =>
+        Math.abs(value) > 56 ? Math.sign(value) * 88 : 0,
+      );
+    }
+    pointerStart.current = null;
   };
 
   return (
     <div className="swipe-shell">
       <div className="swipe-actions swipe-actions-left">
-        <button type="button" onClick={onArchive} disabled={archiveDisabled}>
+        <motion.button
+          type="button"
+          onClick={onArchive}
+          disabled={archiveDisabled}
+          {...controlMotion(reduceMotion)}
+        >
           <Archive size={17} /> Archive
-        </button>
+        </motion.button>
       </div>
       <div
         className={`swipe-actions swipe-actions-right${
           trashAction === "restore" ? " is-restore" : ""
         }`}
       >
-        <button
+        <motion.button
           type="button"
           onClick={onTrashAction}
           disabled={actionsDisabled}
+          {...controlMotion(reduceMotion)}
         >
           {trashAction === "restore" ? (
             <>
@@ -1906,7 +2085,7 @@ function MessageRow({
               <Trash2 size={17} /> Trash
             </>
           )}
-        </button>
+        </motion.button>
       </div>
       <div
         className={`message-row ${thread.unread ? "is-unread" : ""} ${
@@ -1918,7 +2097,7 @@ function MessageRow({
         onPointerUp={pointerUp}
         onPointerCancel={pointerUp}
       >
-        <button
+        <motion.button
           type="button"
           className="message-select"
           disabled={selectionDisabled}
@@ -1927,6 +2106,7 @@ function MessageRow({
             onToggleSelect();
           }}
           aria-label={`${selected ? "Deselect" : "Select"} message from ${thread.sender.name}`}
+          {...controlMotion(reduceMotion)}
         >
           <span className="sender-avatar" aria-hidden="true">
             {initials(thread.sender.name)}
@@ -1934,13 +2114,15 @@ function MessageRow({
           <span className="row-checkbox" aria-hidden="true">
             {selected ? <Check size={13} /> : null}
           </span>
-        </button>
+        </motion.button>
 
-        <button
+        <motion.button
           type="button"
           className="message-open"
           onClick={onOpen}
           aria-current={active ? "true" : undefined}
+          whileTap={reduceMotion ? undefined : { scale: 0.995 }}
+          transition={reduceMotion ? { duration: 0 } : CONTROL_SPRING}
         >
           <span className="message-line-one">
             <span className="sender-name">
@@ -1961,9 +2143,9 @@ function MessageRow({
             </span>
           </span>
           <span className="message-preview">{thread.preview}</span>
-        </button>
+        </motion.button>
 
-        <button
+        <motion.button
           type="button"
           className={`row-star ${thread.starred ? "is-starred" : ""}`}
           disabled={actionsDisabled}
@@ -1972,9 +2154,10 @@ function MessageRow({
             onToggleStar();
           }}
           aria-label={`${thread.starred ? "Remove star from" : "Star"} ${thread.subject}`}
+          {...controlMotion(reduceMotion)}
         >
           <Star size={16} fill={thread.starred ? "currentColor" : "none"} />
-        </button>
+        </motion.button>
       </div>
     </div>
   );
@@ -2021,6 +2204,7 @@ function ReaderPane({
   onArchive: () => void;
   onTrashAction: () => void;
 }) {
+  const reduceMotion = useReducedMotion();
   const [expansionOverrides, setExpansionOverrides] = useState<
     Map<string, boolean>
   >(() => new Map());
@@ -2028,7 +2212,13 @@ function ReaderPane({
   if (!thread) {
     if (loadError) {
       return (
-        <section className="reader-pane reader-empty" id="reader-pane">
+        <motion.section
+          className="reader-pane reader-empty"
+          id="reader-pane"
+          initial={reduceMotion ? false : { opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
+        >
           <QueryErrorNotice
             blocking
             title="Conversation couldn’t be loaded"
@@ -2036,22 +2226,35 @@ function ReaderPane({
             retrying={retrying}
             onRetry={onRetry}
           />
-        </section>
+        </motion.section>
       );
     }
     return (
-      <section className="reader-pane reader-empty" id="reader-pane">
+      <motion.section
+        className="reader-pane reader-empty"
+        id="reader-pane"
+        initial={reduceMotion ? false : { opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
+      >
         <div className="reader-empty-mark">
           <Mail size={25} />
         </div>
         <h2>Select a conversation</h2>
         <p>Messages stay with your mail provider and appear here when selected.</p>
-      </section>
+      </motion.section>
     );
   }
 
   return (
-    <section className="reader-pane" id="reader-pane" aria-labelledby="mail-subject">
+    <motion.section
+      className="reader-pane"
+      id="reader-pane"
+      aria-labelledby="mail-subject"
+      initial={reduceMotion ? false : { opacity: 0, x: 10 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
+    >
       <div className="reader-toolbar">
         <IconButton
           className="reader-back"
@@ -2179,7 +2382,7 @@ function ReaderPane({
           <Reply size={17} />
         </button>
       )}
-    </section>
+    </motion.section>
   );
 }
 
@@ -2196,13 +2399,17 @@ function ThreadArticle({
   current: boolean;
   onToggle: () => void;
 }) {
+  const reduceMotion = useReducedMotion();
+
   return (
     <article className={`thread-message ${current ? "is-current" : ""}`}>
-      <button
+      <motion.button
         type="button"
         className="thread-message-header"
         aria-expanded={expanded}
         onClick={onToggle}
+        whileTap={reduceMotion ? undefined : { scale: 0.995 }}
+        transition={reduceMotion ? { duration: 0 } : CONTROL_SPRING}
       >
         <span className="thread-avatar" aria-hidden="true">
           {initials(message.sender.name)}
@@ -2229,9 +2436,17 @@ function ThreadArticle({
           className={expanded ? "chevron-expanded" : ""}
           aria-hidden="true"
         />
-      </button>
-      {expanded ? (
-        <div className="message-body">
+      </motion.button>
+      <AnimatePresence initial={false}>
+        {expanded ? (
+        <motion.div
+          key="message-body"
+          className="message-body"
+          initial={reduceMotion ? false : { opacity: 0, y: -5 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -4 }}
+          transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
+        >
           {message.contentUrl ? (
             <iframe
               src={mailContentUrl(message.contentUrl, externalImages)}
@@ -2296,8 +2511,9 @@ function ThreadArticle({
               })}
             </div>
           ) : null}
-        </div>
-      ) : null}
+        </motion.div>
+        ) : null}
+      </AnimatePresence>
     </article>
   );
 }
@@ -2714,10 +2930,14 @@ function ComposeDialog({
   return (
     <motion.div
       className="compose-backdrop"
-      initial={{ opacity: 0 }}
+      initial={reduceMotion ? false : { opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: reduceMotion ? 0 : 0.18 }}
+      transition={
+        reduceMotion
+          ? { duration: 0 }
+          : { duration: 0.2, ease: [0.22, 1, 0.36, 1] }
+      }
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) void requestClose();
       }}
@@ -2730,10 +2950,14 @@ function ComposeDialog({
         aria-labelledby="compose-title"
         aria-busy={composeLocked}
         tabIndex={-1}
-        initial={reduceMotion ? false : { opacity: 0, y: 12, scale: 0.99 }}
+        initial={reduceMotion ? false : { opacity: 0, y: 22, scale: 0.975 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 8 }}
-        transition={{ duration: reduceMotion ? 0 : 0.22 }}
+        exit={
+          reduceMotion
+            ? { opacity: 0 }
+            : { opacity: 0, y: 14, scale: 0.985 }
+        }
+        transition={reduceMotion ? { duration: 0 } : SURFACE_SPRING}
         onKeyDown={(event) => {
           if (event.key === "Escape") void requestClose();
           if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -3370,23 +3594,36 @@ function IconButton({
   onClick,
   className = "",
   disabled = false,
+  buttonRef,
+  ariaExpanded,
+  ariaControls,
 }: {
   label: string;
   icon: LucideIcon;
   onClick?: () => void;
   className?: string;
   disabled?: boolean;
+  buttonRef?: Ref<HTMLButtonElement>;
+  ariaExpanded?: boolean;
+  ariaControls?: string;
 }) {
+  const reduceMotion = useReducedMotion();
+
   return (
-    <button
+    <motion.button
+      ref={buttonRef}
       type="button"
       className={`icon-button ${className}`}
       onClick={onClick}
       disabled={disabled}
       aria-label={label}
+      aria-expanded={ariaExpanded}
+      aria-controls={ariaControls}
       title={label}
+      {...controlMotion(reduceMotion)}
     >
       <Icon size={18} aria-hidden="true" />
-    </button>
+    </motion.button>
   );
 }
+
