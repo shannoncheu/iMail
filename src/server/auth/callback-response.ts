@@ -3,6 +3,7 @@ import "server-only";
 import type { AuthConfig } from "../config";
 import { noStoreHeaders } from "../http";
 import {
+  clearMailOAuthCookie,
   clearOAuthCookie,
   serializeSessionCookie,
 } from "../security/cookies";
@@ -26,6 +27,42 @@ export function createLoginCompletionResponse({
   returnTo: string;
   sessionToken: string;
 }): Response {
+  return createOAuthCompletionResponse({
+    config,
+    returnTo,
+    sessionToken,
+    transaction: "identity",
+  });
+}
+
+export function createMailConnectionCompletionResponse({
+  config,
+  returnTo,
+  sessionToken,
+}: {
+  config: AuthConfig;
+  returnTo: string;
+  sessionToken: string;
+}): Response {
+  return createOAuthCompletionResponse({
+    config,
+    returnTo,
+    sessionToken,
+    transaction: "mail",
+  });
+}
+
+function createOAuthCompletionResponse({
+  config,
+  returnTo,
+  sessionToken,
+  transaction,
+}: {
+  config: AuthConfig;
+  returnTo: string;
+  sessionToken: string;
+  transaction: "identity" | "mail";
+}): Response {
   const destination = escapeHtml(returnTo);
   const headers = noStoreHeaders({
     "Content-Type": "text/html; charset=utf-8",
@@ -34,7 +71,12 @@ export function createLoginCompletionResponse({
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
   });
-  headers.append("Set-Cookie", clearOAuthCookie(authCookieContext(config)));
+  headers.append(
+    "Set-Cookie",
+    transaction === "mail"
+      ? clearMailOAuthCookie(authCookieContext(config))
+      : clearOAuthCookie(authCookieContext(config)),
+  );
   headers.append(
     "Set-Cookie",
     serializeSessionCookie(sessionToken, authCookieContext(config)),

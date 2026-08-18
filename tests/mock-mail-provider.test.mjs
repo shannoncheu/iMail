@@ -52,6 +52,7 @@ test("sent messages are visible and update folder counts", async () => {
   const afterFolders = await provider.getFolders("gmail");
 
   assert.equal(sent[0]?.id, id);
+  assert.equal(Number.isSafeInteger(sent[0]?.receivedAtMs), true);
   assert.equal(
     afterFolders.find((folder) => folder.id === "sent")?.count,
     (beforeSent ?? 0) + 1,
@@ -71,6 +72,7 @@ test("saving the same draft updates it instead of duplicating it", async () => {
   );
 
   const saved = await provider.getMessage(first.id);
+  const editable = await provider.getDraft(first.id);
   const drafts = await provider.getMessages({
     scope: "all",
     folder: "drafts",
@@ -79,6 +81,9 @@ test("saving the same draft updates it instead of duplicating it", async () => {
   assert.equal(saved?.subject, "Updated subject");
   assert.equal(saved?.accountId, "account-outlook");
   assert.equal(saved?.provider, "outlook");
+  assert.equal(editable?.id, first.id);
+  assert.equal(editable?.subject, "Updated subject");
+  assert.equal(editable?.body, "Updated body");
   assert.equal(
     drafts.filter((thread) => thread.id === first.id).length,
     1,

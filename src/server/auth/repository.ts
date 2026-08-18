@@ -17,6 +17,7 @@ import type {
   OwnerSession,
   RecordSecurityEventInput,
   RotateOwnerSessionInput,
+  RotateOwnerSessionByIdInput,
   SafeMailConnection,
   SecurityEvent,
   UpsertOwnerIdentityInput,
@@ -285,6 +286,91 @@ export class AuthRepository {
     );
 
     return rows[0] ? toOwnerSession(rows[0]) : null;
+  }
+
+  async rotateOwnerSessionById(
+    input: RotateOwnerSessionByIdInput,
+  ): Promise<OwnerSession | null> {
+    const id = input.id ?? crypto.randomUUID();
+    const createdAt = input.createdAt ?? new Date();
+    const rows = await this.query<SessionRow>(
+      `
+        WITH revoked AS (
+          UPDATE sessions AS session
+          SET revoked_at = $1
+          FROM owner_identities AS identity
+          WHERE session.id = $2
+            AND session.revoked_at IS NULL
+            AND session.expires_at > $1
+            AND identity.id = session.identity_id
+            AND identity.provider = 'github'
+            AND identity.provider_subject = ANY($8::text[])
+          RETURNING session.id, session.owner_id, session.identity_id
+        )
+        INSERT INTO sessions (
+          id,
+          owner_id,
+          identity_id,
+          token_digest,
+          rotated_from_session_id,
+          created_at,
+          last_seen_at,
+          expires_at,
+          ip_hash,
+          user_agent_hash
+        )
+        SELECT $3, owner.id, revoked.identity_id, $4, revoked.id, $1, $1, $5, $6, $7
+        FROM revoked
+        JOIN owners AS owner ON owner.id = revoked.owner_id
+        WHERE owner.disabled_at IS NULL
+        RETURNING *
+      `,
+      [
+        createdAt,
+        input.previousSessionId,
+        id,
+        input.tokenDigest,
+        input.expiresAt,
+        input.ipHash ?? null,
+        input.userAgentHash ?? null,
+        [...input.allowedGithubIds],
+      ],
+    );
+    return rows[0] ? toOwnerSession(rows[0]) : null;
+  }
+
+  async isOwnerSessionAuthorizedForGithubIds(input: {
+    sessionId: string;
+    ownerId: string;
+    allowedGithubIds: readonly string[];
+    activeAt?: Date;
+  }): Promise<boolean> {
+    if (input.allowedGithubIds.length === 0) return false;
+    const rows = await this.query<{ id: unknown }>(
+      `
+        SELECT session.id
+        FROM sessions AS session
+        JOIN owner_identities AS identity
+          ON identity.id = session.identity_id
+         AND identity.owner_id = session.owner_id
+        JOIN owners AS owner ON owner.id = session.owner_id
+        WHERE session.id = $1
+          AND session.owner_id = $2
+          AND identity.provider = 'github'
+          AND identity.provider_subject = ANY($3::text[])
+          AND session.revoked_at IS NULL
+          AND session.expires_at > $4
+          AND owner.disabled_at IS NULL
+        LIMIT 1
+      `,
+      [
+        input.sessionId,
+        input.ownerId,
+        [...input.allowedGithubIds],
+        input.activeAt ?? new Date(),
+      ],
+    );
+    return rows.length > 0;
   }
 
   async findSessionByDigest(

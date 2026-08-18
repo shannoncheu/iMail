@@ -153,6 +153,42 @@ test("owner identity upsert modifies the singleton owner only once", async () =>
   assert.doesNotMatch(statement, /UPDATE owners AS owner/);
 });
 
+test("mail OAuth rechecks the transaction session against its current GitHub identity", async () => {
+  let captured;
+  const activeAt = new Date("2026-08-18T00:05:00.000Z");
+  const repository = new AuthRepository({
+    query: async (statement, parameters) => {
+      captured = { statement, parameters };
+      return [{ id: "33333333-3333-4333-8333-333333333333" }];
+    },
+  });
+
+  assert.equal(
+    await repository.isOwnerSessionAuthorizedForGithubIds({
+      sessionId: "33333333-3333-4333-8333-333333333333",
+      ownerId: "22222222-2222-4222-8222-222222222222",
+      allowedGithubIds: ["1", "2"],
+      activeAt,
+    }),
+    true,
+  );
+  assert.match(captured.statement, /identity\.id = session\.identity_id/u);
+  assert.match(captured.statement, /identity\.owner_id = session\.owner_id/u);
+  assert.match(captured.statement, /identity\.provider = 'github'/u);
+  assert.match(
+    captured.statement,
+    /identity\.provider_subject = ANY\(\$3::text\[\]\)/u,
+  );
+  assert.match(captured.statement, /session\.revoked_at IS NULL/u);
+  assert.match(captured.statement, /owner\.disabled_at IS NULL/u);
+  assert.deepEqual(captured.parameters, [
+    "33333333-3333-4333-8333-333333333333",
+    "22222222-2222-4222-8222-222222222222",
+    ["1", "2"],
+    activeAt,
+  ]);
+});
+
 test("safe mail connection queries never select credential columns", async () => {
   let statement;
   const repository = new AuthRepository({

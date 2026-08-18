@@ -93,7 +93,10 @@ export async function GET(request: Request): Promise<Response> {
     const code = url.searchParams.get("code");
     if (!code) return authError(config, "oauth_failed");
 
-    const key = await oauthEncryptionKey(config);
+    const key = await oauthEncryptionKey(
+      config,
+      transaction.codeVerifierEnvelope.keyVersion,
+    );
     const verifier = await decryptAes256GcmText(
       key,
       transaction.codeVerifierEnvelope,

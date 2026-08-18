@@ -16,7 +16,17 @@ export function oauthVerifierAad(
   return `oauth-transaction|${transactionId}|${provider}|${keyVersion}`;
 }
 
-export async function oauthEncryptionKey(config: AuthConfig): Promise<CryptoKey> {
-  const rawKey = decodeBase64Url(config.tokenEncryptionKey);
+export async function oauthEncryptionKey(
+  config: AuthConfig,
+  keyVersion = config.tokenEncryptionKeyVersion ?? OAUTH_TRANSACTION_KEY_VERSION,
+): Promise<CryptoKey> {
+  const currentVersion =
+    config.tokenEncryptionKeyVersion ?? OAUTH_TRANSACTION_KEY_VERSION;
+  const encodedKey =
+    keyVersion === currentVersion
+      ? config.tokenEncryptionKey
+      : config.previousTokenEncryptionKeys?.get(keyVersion);
+  if (!encodedKey) throw new Error("Token encryption key version is unavailable");
+  const rawKey = decodeBase64Url(encodedKey);
   return importAes256GcmKey(rawKey);
 }
