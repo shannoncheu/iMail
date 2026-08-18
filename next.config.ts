@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  /* vinext and Worker behavior is configured in vite.config.ts and worker/. */
 };
 
 export default nextConfig;

@@ -13,6 +13,7 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 
 const localBindingConfig = {
   main: "./worker/index.ts",
+  compatibility_date: "2025-09-01",
   compatibility_flags: ["nodejs_compat"],
   d1_databases: d1
     ? [
@@ -46,6 +47,8 @@ export default defineConfig(async () => {
   return {
     server: {
       host: "0.0.0.0",
+      port: 3000,
+      strictPort: true,
       allowedHosts: ["terminal.local"],
       ...(isCodexSeatbeltSandbox
         ? { watch: { useFsEvents: false, usePolling: true } }

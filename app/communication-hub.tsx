@@ -74,11 +74,12 @@ import {
   type ProviderSource,
   type ThreadMessage,
 } from "@/src/providers/mail";
+import type { AuthenticatedViewer } from "@/src/auth/viewer";
 
 type Scope = "all" | ProviderSource;
 type ThemeMode = "light" | "dark" | "system";
 type Density = "compact" | "comfortable" | "relaxed";
-type AppView = "mail" | "settings" | "login";
+type AppView = "mail" | "settings";
 type ComposeMode = "new" | "reply" | "forward";
 
 interface ToastState {
@@ -162,7 +163,13 @@ function splitRecipients(value: string) {
     .filter(Boolean);
 }
 
-export default function CommunicationHub() {
+export default function CommunicationHub({
+  viewer,
+  csrfToken,
+}: {
+  viewer: AuthenticatedViewer;
+  csrfToken: string;
+}) {
   const [queryClient] = useState(
     () =>
       new QueryClient({
@@ -178,12 +185,20 @@ export default function CommunicationHub() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <Hub provider={provider} />
+      <Hub provider={provider} viewer={viewer} csrfToken={csrfToken} />
     </QueryClientProvider>
   );
 }
 
-function Hub({ provider }: { provider: MailProvider }) {
+function Hub({
+  provider,
+  viewer,
+  csrfToken,
+}: {
+  provider: MailProvider;
+  viewer: AuthenticatedViewer;
+  csrfToken: string;
+}) {
   const queryClient = useQueryClient();
   const reduceMotion = useReducedMotion();
   const [view, setView] = useState<AppView>("mail");
@@ -220,6 +235,7 @@ function Hub({ provider }: { provider: MailProvider }) {
     new Set(),
   );
   const [pendingMailAction, setPendingMailAction] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
   const mailActionPendingRef = useRef(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const composeButtonRef = useRef<HTMLButtonElement>(null);
@@ -335,6 +351,29 @@ function Hub({ provider }: { provider: MailProvider }) {
       queryClient.invalidateQueries({ queryKey: ["mail", "messages"] }),
       queryClient.invalidateQueries({ queryKey: ["mail", "folders"] }),
     ]);
+  };
+
+  const signOut = async () => {
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      const response = await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-csrf-token": csrfToken,
+        },
+        body: "{}",
+      });
+      if (!response.ok) throw new Error("Sign-out failed");
+      window.location.assign("/");
+    } catch {
+      setToast({
+        message: "Couldn’t sign out. Please try again.",
+        tone: "error",
+      });
+      setSigningOut(false);
+    }
   };
 
   const startMailAction = (action: string) => {
@@ -516,10 +555,6 @@ function Hub({ provider }: { provider: MailProvider }) {
     setMobilePane("list");
   };
 
-  if (view === "login") {
-    return <LoginView onEnter={() => setView("mail")} />;
-  }
-
   return (
     <div
       className="hub-shell"
@@ -621,7 +656,7 @@ function Hub({ provider }: { provider: MailProvider }) {
               aria-label="Open account menu"
               aria-expanded={accountMenuOpen}
             >
-              PH
+              {initials(viewer.displayName || viewer.login)}
               <span className="presence-dot" />
             </button>
             <AnimatePresence>
@@ -634,8 +669,8 @@ function Hub({ provider }: { provider: MailProvider }) {
                   transition={{ duration: reduceMotion ? 0 : 0.15 }}
                 >
                   <div className="account-popover-head">
-                    <strong>Private owner</strong>
-                    <span>Owner access</span>
+                    <strong>{viewer.displayName}</strong>
+                    <span>@{viewer.login} · Owner access</span>
                   </div>
                   <button
                     type="button"
@@ -649,12 +684,10 @@ function Hub({ provider }: { provider: MailProvider }) {
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      setView("login");
-                      setAccountMenuOpen(false);
-                    }}
+                    disabled={signingOut}
+                    onClick={() => void signOut()}
                   >
-                    <LogOut size={16} /> Sign out of mock session
+                    <LogOut size={16} /> {signingOut ? "Signing out…" : "Sign out"}
                   </button>
                 </motion.div>
               ) : null}
@@ -881,6 +914,7 @@ function Hub({ provider }: { provider: MailProvider }) {
           section={settingsSection}
           setSection={setSettingsSection}
           accounts={accountsQuery.data ?? []}
+          viewer={viewer}
           theme={theme}
           setTheme={setTheme}
           density={density}
@@ -888,7 +922,7 @@ function Hub({ provider }: { provider: MailProvider }) {
           externalImages={externalImages}
           setExternalImages={setExternalImages}
           onBack={() => setView("mail")}
-          onSignOut={() => setView("login")}
+          onSignOut={() => void signOut()}
         />
       )}
 
@@ -1999,6 +2033,7 @@ function SettingsView({
   section,
   setSection,
   accounts,
+  viewer,
   theme,
   setTheme,
   density,
@@ -2011,6 +2046,7 @@ function SettingsView({
   section: string;
   setSection: (section: string) => void;
   accounts: MailAccount[];
+  viewer: AuthenticatedViewer;
   theme: ThemeMode;
   setTheme: (theme: ThemeMode) => void;
   density: Density;
@@ -2133,9 +2169,11 @@ function SettingsView({
                       <small>{account.address}</small>
                     </span>
                     <span className="connected-status">
-                      <i /> Connected
+                      <i /> Demo data
                     </span>
-                    <button type="button">Manage</button>
+                    <button type="button" disabled title="Real mailbox connections are not implemented">
+                      Manage
+                    </button>
                   </div>
                 ))}
               </SettingsGroup>
@@ -2146,10 +2184,9 @@ function SettingsView({
                   </span>
                   <span>
                     <strong>GitHub</strong>
-                    <small>Identity only — no notification access</small>
+                    <small>@{viewer.login} · Identity only</small>
                   </span>
-                  <span className="identity-status">Not connected</span>
-                  <button type="button">Connect</button>
+                  <span className="identity-status">Verified</span>
                 </div>
               </SettingsGroup>
               <button type="button" className="secondary-wide" onClick={onSignOut}>
@@ -2162,7 +2199,7 @@ function SettingsView({
             <>
               <SettingsHeader
                 title="Security"
-                description="Review active sessions and remove access you no longer recognize."
+                description="Review the identity and session protecting this browser."
               />
               <div className="security-notice">
                 <LockKeyhole size={19} />
@@ -2174,15 +2211,17 @@ function SettingsView({
               <SettingsGroup title="Current devices">
                 <SessionRow
                   name="Current browser"
-                  detail="Tokyo · Active now"
+                  detail={`Signed in as @${viewer.login}`}
                   current
                 />
-                <SessionRow name="Mobile device" detail="Tokyo · 2 hours ago" />
-                <SessionRow name="Desktop browser" detail="Osaka · 6 days ago" />
               </SettingsGroup>
-              <button type="button" className="danger-button">
-                Revoke all other sessions
-              </button>
+              <div className="security-notice">
+                <ShieldCheck size={19} />
+                <div>
+                  <strong>Other-session management is not available yet</strong>
+                  <span>Use “Sign out of this session” in Accounts to revoke this browser.</span>
+                </div>
+              </div>
             </>
           ) : null}
         </div>
@@ -2307,51 +2346,6 @@ function SessionRow({
         <button type="button">Revoke</button>
       )}
     </div>
-  );
-}
-
-function LoginView({ onEnter }: { onEnter: () => void }) {
-  const providers = [
-    ["Google", "gmail"],
-    ["Microsoft", "outlook"],
-    ["Zoho", "zoho"],
-    ["GitHub", "github"],
-  ] as const;
-  return (
-    <main className="login-page">
-      <section className="login-panel">
-        <div className="login-brand">
-          <span className="brand-mark large" aria-hidden="true">
-            <span />
-            <i />
-          </span>
-          <span>Private Hub</span>
-        </div>
-        <div className="login-copy">
-          <span className="private-badge">
-            <LockKeyhole size={13} /> Private access
-          </span>
-          <h1>Your communication, in one quiet place.</h1>
-          <p>Sign in with an approved identity. This application does not offer public registration.</p>
-        </div>
-        <div className="login-options">
-          {providers.map(([label, id]) => (
-            <button type="button" key={id} onClick={onEnter}>
-              {id === "github" ? (
-                <span className="github-mark">GH</span>
-              ) : (
-                <ProviderMark provider={id} />
-              )}
-              Continue with {label}
-              <ChevronRight size={16} />
-            </button>
-          ))}
-        </div>
-        <p className="login-footnote">
-          Access is denied by default and checked again after OAuth completes.
-        </p>
-      </section>
-    </main>
   );
 }
 
