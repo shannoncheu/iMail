@@ -24,16 +24,16 @@ export function LoginView({
             <span />
             <i />
           </span>
-          <span>Private Hub</span>
+          <span>iMail</span>
         </div>
         <div className="login-copy">
           <span className="private-badge">
-            <LockKeyhole size={13} /> Private access
+            <LockKeyhole size={13} /> Owner-only workspace
           </span>
-          <h1 id="login-title">Your communication, in one quiet place.</h1>
+          <h1 id="login-title">All your mail. One calm workspace.</h1>
           <p>
-            Sign in with the approved GitHub identity. There is no public
-            registration.
+            Connect Gmail, Outlook, and Zoho after signing in with the approved
+            GitHub identity. There is no public registration.
           </p>
         </div>
         {errorMessage ? (
@@ -58,3 +58,4 @@ export function LoginView({
     </main>
   );
 }
+
