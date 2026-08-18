@@ -78,6 +78,7 @@ export interface MessageQuery {
 }
 
 export interface MailDraft {
+  id?: string;
   accountId: string;
   to: string[];
   cc: string[];
@@ -87,9 +88,15 @@ export interface MailDraft {
   attachments: MailAttachment[];
 }
 
+export interface MessageLocation {
+  id: string;
+  folder: MailFolderId;
+}
+
 export interface OperationResult {
   succeeded: string[];
   failed: Array<{ id: string; reason: string }>;
+  previousLocations?: MessageLocation[];
 }
 
 /**
@@ -108,6 +115,7 @@ export interface MailProvider {
   archiveMessages(ids: string[]): Promise<OperationResult>;
   moveToTrash(ids: string[]): Promise<OperationResult>;
   restoreFromTrash(ids: string[]): Promise<OperationResult>;
+  restoreMessages(locations: MessageLocation[]): Promise<OperationResult>;
   markRead(ids: string[], read: boolean): Promise<OperationResult>;
   setStarred(id: string, starred: boolean): Promise<OperationResult>;
   searchMessages(query: MessageQuery): Promise<MailThread[]>;

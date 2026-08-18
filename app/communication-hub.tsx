@@ -56,6 +56,7 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -64,10 +65,12 @@ import {
 import {
   createMailProvider,
   type MailAccount,
+  type MailAttachment,
   type MailDraft,
   type MailFolderId,
   type MailProvider,
   type MailThread,
+  type MessageLocation,
   type ProviderSource,
   type ThreadMessage,
 } from "@/src/providers/mail";
@@ -82,6 +85,7 @@ interface ToastState {
   message: string;
   actionLabel?: string;
   onAction?: () => void;
+  tone?: "success" | "error";
 }
 
 const folderConfig: Array<{
@@ -126,6 +130,38 @@ function initials(name: string) {
     .toUpperCase();
 }
 
+const monthNumbers: Record<string, string> = {
+  January: "01",
+  February: "02",
+  March: "03",
+  April: "04",
+  May: "05",
+  June: "06",
+  July: "07",
+  August: "08",
+  September: "09",
+  October: "10",
+  November: "11",
+  December: "12",
+};
+
+function toDateTime(value: string) {
+  const match = value.match(
+    /(?:^|\s)(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s+at\s+(\d{2}:\d{2})/,
+  );
+  if (!match) return undefined;
+  const [, day, monthName, year, time] = match;
+  const month = monthNumbers[monthName];
+  return month ? `${year}-${month}-${day.padStart(2, "0")}T${time}` : undefined;
+}
+
+function splitRecipients(value: string) {
+  return value
+    .split(/[;,]/)
+    .map((recipient) => recipient.trim())
+    .filter(Boolean);
+}
+
 export default function CommunicationHub() {
   const [queryClient] = useState(
     () =>
@@ -156,6 +192,7 @@ function Hub({ provider }: { provider: MailProvider }) {
   const [selectedId, setSelectedId] = useState("design-review");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [searchTerm, setSearchTerm] = useState("");
+  const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("");
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") return "system";
     const stored = window.localStorage.getItem("hub-theme");
@@ -179,8 +216,44 @@ function Hub({ provider }: { provider: MailProvider }) {
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [externalImages, setExternalImages] = useState(false);
+  const [loadedImageThreadIds, setLoadedImageThreadIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [pendingMailAction, setPendingMailAction] = useState<string | null>(null);
+  const mailActionPendingRef = useRef(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const composeButtonRef = useRef<HTMLButtonElement>(null);
+  const composeReturnFocusRef = useRef<HTMLElement | null>(null);
+  const composeModeRef = useRef<ComposeMode | null>(null);
+
+  const openCompose = useCallback((mode: ComposeMode) => {
+    if (composeModeRef.current) return;
+    const activeElement = document.activeElement;
+    composeReturnFocusRef.current =
+      activeElement instanceof HTMLElement
+        ? activeElement
+        : composeButtonRef.current;
+    composeModeRef.current = mode;
+    setComposeMode(mode);
+  }, []);
+
+  const closeCompose = useCallback(() => {
+    composeModeRef.current = null;
+    setComposeMode(null);
+    window.setTimeout(() => {
+      const returnTarget = composeReturnFocusRef.current;
+      if (returnTarget?.isConnected) returnTarget.focus();
+      else composeButtonRef.current?.focus();
+    }, 0);
+  }, []);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      () => setDebouncedSearchTerm(searchTerm.trim()),
+      250,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [searchTerm]);
 
   const accountsQuery = useQuery({
     queryKey: ["mail", "accounts"],
@@ -191,12 +264,12 @@ function Hub({ provider }: { provider: MailProvider }) {
     queryFn: () => provider.getFolders(scope),
   });
   const messagesQuery = useQuery({
-    queryKey: ["mail", "messages", scope, folder, searchTerm],
+    queryKey: ["mail", "messages", scope, folder, debouncedSearchTerm],
     queryFn: () =>
       provider.getMessages({
         scope,
         folder,
-        search: searchTerm,
+        search: debouncedSearchTerm,
       }),
     placeholderData: (previous) => previous,
   });
@@ -204,6 +277,9 @@ function Hub({ provider }: { provider: MailProvider }) {
   const threads = messagesQuery.data ?? [];
   const activeThread =
     threads.find((thread) => thread.id === selectedId) ?? threads[0] ?? null;
+  const activeThreadPosition = activeThread
+    ? threads.findIndex((thread) => thread.id === activeThread.id) + 1
+    : 0;
   const selectedAccount =
     accountsQuery.data?.find(
       (account) => account.id === activeThread?.accountId,
@@ -220,26 +296,38 @@ function Hub({ provider }: { provider: MailProvider }) {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      const commandKey = event.metaKey || event.ctrlKey;
+      const key = event.key.toLowerCase();
+      const searchShortcut = commandKey && key === "k";
+      const composeShortcut = commandKey && event.shiftKey && key === "m";
+
+      if (composeModeRef.current) {
+        if (searchShortcut || composeShortcut) event.preventDefault();
+        return;
+      }
+      if (searchShortcut) {
         event.preventDefault();
         searchRef.current?.focus();
       }
-      if (
-        (event.metaKey || event.ctrlKey) &&
-        event.shiftKey &&
-        event.key.toLowerCase() === "m"
-      ) {
+      if (composeShortcut) {
         event.preventDefault();
-        setComposeMode("new");
+        openCompose("new");
       }
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, []);
+  }, [openCompose]);
 
   const refreshMail = async () => {
-    await queryClient.invalidateQueries({ queryKey: ["mail"] });
-    setToast({ message: "Mailbox refreshed" });
+    try {
+      await queryClient.invalidateQueries({ queryKey: ["mail"] });
+      setToast({ message: "Mailbox refreshed" });
+    } catch {
+      setToast({
+        message: "Mailbox refresh failed. Please try again.",
+        tone: "error",
+      });
+    }
   };
 
   const updateMessages = async () => {
@@ -249,49 +337,168 @@ function Hub({ provider }: { provider: MailProvider }) {
     ]);
   };
 
+  const startMailAction = (action: string) => {
+    if (mailActionPendingRef.current) return false;
+    mailActionPendingRef.current = true;
+    setPendingMailAction(action);
+    return true;
+  };
+
+  const finishMailAction = () => {
+    mailActionPendingRef.current = false;
+    setPendingMailAction(null);
+  };
+
   const runMove = async (kind: "archive" | "trash", ids: string[]) => {
     if (ids.length === 0) return;
-    if (kind === "archive") {
-      await provider.archiveMessages(ids);
-    } else {
-      await provider.moveToTrash(ids);
-    }
-    setSelectedIds(new Set());
-    await updateMessages();
-    setToast({
-      message:
-        kind === "archive"
-          ? `${ids.length} message${ids.length > 1 ? "s" : ""} archived`
-          : `${ids.length} message${ids.length > 1 ? "s" : ""} moved to Trash`,
-      actionLabel: "Undo",
-      onAction: async () => {
-        await provider.restoreFromTrash(ids);
-        await updateMessages();
-        setToast({ message: "Message restored" });
-      },
+    const originalLocations: MessageLocation[] = ids.flatMap((id) => {
+      const thread = threads.find((candidate) => candidate.id === id);
+      return thread ? [{ id, folder: thread.folder }] : [];
     });
+
+    if (originalLocations.length !== ids.length) {
+      setToast({
+        message: "Couldn’t determine every message’s original folder.",
+        tone: "error",
+      });
+      return;
+    }
+
+    if (!startMailAction(kind)) return;
+    try {
+      const result =
+        kind === "archive"
+          ? await provider.archiveMessages(ids)
+          : await provider.moveToTrash(ids);
+      const restoredLocations = originalLocations.filter((location) =>
+        result.succeeded.includes(location.id),
+      );
+      setSelectedIds(new Set());
+      await updateMessages();
+
+      const action = kind === "archive" ? "archived" : "moved to Trash";
+      const failureNote = result.failed.length
+        ? `; ${result.failed.length} failed`
+        : "";
+      setToast({
+        message: `${result.succeeded.length} message${
+          result.succeeded.length === 1 ? "" : "s"
+        } ${action}${failureNote}`,
+        tone: result.failed.length ? "error" : "success",
+        ...(restoredLocations.length
+          ? {
+              actionLabel: "Undo",
+              onAction: () => {
+                void (async () => {
+                  if (!startMailAction("restore")) return;
+                  try {
+                    const restoreResult = await provider.restoreMessages(
+                      restoredLocations,
+                    );
+                    await updateMessages();
+                    setToast({
+                      message: restoreResult.failed.length
+                        ? `${restoreResult.succeeded.length} restored; ${restoreResult.failed.length} failed`
+                        : `${restoreResult.succeeded.length} message${
+                            restoreResult.succeeded.length === 1 ? "" : "s"
+                          } restored`,
+                      tone: restoreResult.failed.length ? "error" : "success",
+                    });
+                  } catch {
+                    setToast({
+                      message: "Couldn’t undo the move. Please try again.",
+                      tone: "error",
+                    });
+                  } finally {
+                    finishMailAction();
+                  }
+                })();
+              },
+            }
+          : {}),
+      });
+    } catch {
+      setToast({
+        message:
+          kind === "archive"
+            ? "Couldn’t archive the selected messages."
+            : "Couldn’t move the selected messages to Trash.",
+        tone: "error",
+      });
+    } finally {
+      finishMailAction();
+    }
   };
 
   const markSelected = async (read: boolean) => {
     const ids = Array.from(selectedIds);
-    if (ids.length === 0) return;
-    await provider.markRead(ids, read);
-    setSelectedIds(new Set());
-    await updateMessages();
-    setToast({ message: read ? "Marked as read" : "Marked as unread" });
+    if (ids.length === 0 || !startMailAction("read")) return;
+    try {
+      const result = await provider.markRead(ids, read);
+      setSelectedIds(new Set());
+      await updateMessages();
+      setToast({
+        message: result.failed.length
+          ? `${result.succeeded.length} updated; ${result.failed.length} failed`
+          : read
+            ? "Marked as read"
+            : "Marked as unread",
+        tone: result.failed.length ? "error" : "success",
+      });
+    } catch {
+      setToast({
+        message: `Couldn’t mark the selected messages as ${
+          read ? "read" : "unread"
+        }.`,
+        tone: "error",
+      });
+    } finally {
+      finishMailAction();
+    }
   };
 
   const toggleStar = async (thread: MailThread) => {
-    await provider.setStarred(thread.id, !thread.starred);
-    await updateMessages();
+    if (!startMailAction("star")) return;
+    try {
+      const starred = !thread.starred;
+      const result = await provider.setStarred(thread.id, starred);
+      await updateMessages();
+      setToast({
+        message: result.failed.length
+          ? "Couldn’t update the star."
+          : starred
+            ? "Message starred"
+            : "Star removed",
+        tone: result.failed.length ? "error" : "success",
+      });
+    } catch {
+      setToast({ message: "Couldn’t update the star.", tone: "error" });
+    } finally {
+      finishMailAction();
+    }
   };
 
   const openThread = async (thread: MailThread) => {
     setSelectedId(thread.id);
     setMobilePane("reader");
-    if (thread.unread) {
-      await provider.markRead([thread.id], true);
-      await updateMessages();
+    if (thread.unread && startMailAction("read")) {
+      try {
+        const result = await provider.markRead([thread.id], true);
+        await updateMessages();
+        if (result.failed.length) {
+          setToast({
+            message: "Message opened, but it couldn’t be marked as read.",
+            tone: "error",
+          });
+        }
+      } catch {
+        setToast({
+          message: "Message opened, but it couldn’t be marked as read.",
+          tone: "error",
+        });
+      } finally {
+        finishMailAction();
+      }
     }
   };
 
@@ -307,11 +514,6 @@ function Hub({ provider }: { provider: MailProvider }) {
     setSelectedIds(new Set());
     setSidebarOpen(false);
     setMobilePane("list");
-  };
-
-  const closeCompose = () => {
-    setComposeMode(null);
-    window.setTimeout(() => composeButtonRef.current?.focus(), 0);
   };
 
   if (view === "login") {
@@ -336,9 +538,12 @@ function Hub({ provider }: { provider: MailProvider }) {
         <div className="topbar-brand">
           <IconButton
             className="mobile-menu-button"
-            label="Open navigation"
-            onClick={() => setSidebarOpen(true)}
-            icon={Menu}
+            label={view === "settings" ? "Back to mail" : "Open navigation"}
+            onClick={() => {
+              if (view === "settings") setView("mail");
+              else setSidebarOpen(true);
+            }}
+            icon={view === "settings" ? ArrowLeft : Menu}
           />
           <button
             className="brand-button"
@@ -479,7 +684,7 @@ function Hub({ provider }: { provider: MailProvider }) {
               ref={composeButtonRef}
               type="button"
               className="compose-primary"
-              onClick={() => setComposeMode("new")}
+              onClick={() => openCompose("new")}
             >
               <PencilLine size={18} />
               <span>Compose</span>
@@ -575,16 +780,19 @@ function Hub({ provider }: { provider: MailProvider }) {
                       label="Archive selected"
                       icon={Archive}
                       onClick={() => runMove("archive", Array.from(selectedIds))}
+                      disabled={Boolean(pendingMailAction)}
                     />
                     <IconButton
                       label="Mark selected as read"
                       icon={MailOpen}
                       onClick={() => markSelected(true)}
+                      disabled={Boolean(pendingMailAction)}
                     />
                     <IconButton
                       label="Move selected to Trash"
                       icon={Trash2}
                       onClick={() => runMove("trash", Array.from(selectedIds))}
+                      disabled={Boolean(pendingMailAction)}
                     />
                   </div>
                 </div>
@@ -623,17 +831,33 @@ function Hub({ provider }: { provider: MailProvider }) {
                 onToggleStar={toggleStar}
                 onArchive={(id) => runMove("archive", [id])}
                 onTrash={(id) => runMove("trash", [id])}
+                actionsDisabled={Boolean(pendingMailAction)}
               />
             </section>
 
             <ReaderPane
               key={activeThread?.id ?? "empty-reader"}
               thread={activeThread}
-              externalImages={externalImages}
-              onLoadImages={() => setExternalImages(true)}
+              externalImages={
+                externalImages ||
+                Boolean(
+                  activeThread && loadedImageThreadIds.has(activeThread.id),
+                )
+              }
+              onLoadImages={() => {
+                if (!activeThread) return;
+                setLoadedImageThreadIds((current) => {
+                  const next = new Set(current);
+                  next.add(activeThread.id);
+                  return next;
+                });
+              }}
+              position={activeThreadPosition}
+              total={threads.length}
+              actionsDisabled={Boolean(pendingMailAction)}
               onBack={() => setMobilePane("list")}
-              onReply={() => setComposeMode("reply")}
-              onForward={() => setComposeMode("forward")}
+              onReply={() => openCompose("reply")}
+              onForward={() => openCompose("forward")}
               onArchive={() =>
                 activeThread && runMove("archive", [activeThread.id])
               }
@@ -646,7 +870,7 @@ function Hub({ provider }: { provider: MailProvider }) {
           <button
             type="button"
             className="compose-fab"
-            onClick={() => setComposeMode("new")}
+            onClick={() => openCompose("new")}
             aria-label="Compose message"
           >
             <PencilLine size={21} />
@@ -678,9 +902,19 @@ function Hub({ provider }: { provider: MailProvider }) {
             activeThread={activeThread}
             selectedAccount={selectedAccount}
             onClose={closeCompose}
-            onSent={() => {
-              closeCompose();
-              setToast({ message: "Message sent" });
+            onSent={async () => {
+              setToast({ message: "Message sent. Refreshing mailbox…" });
+              try {
+                await updateMessages();
+                setToast({ message: "Message sent" });
+              } catch {
+                setToast({
+                  message: "Message sent, but the mailbox couldn’t refresh.",
+                  tone: "error",
+                });
+              } finally {
+                closeCompose();
+              }
             }}
           />
         ) : null}
@@ -689,13 +923,17 @@ function Hub({ provider }: { provider: MailProvider }) {
       <AnimatePresence>
         {toast ? (
           <motion.div
-            className="toast"
-            role="status"
+            className={`toast ${toast.tone === "error" ? "is-error" : ""}`}
+            role={toast.tone === "error" ? "alert" : "status"}
             initial={reduceMotion ? false : { opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 8 }}
           >
-            <CheckCircle2 size={17} />
+            {toast.tone === "error" ? (
+              <AlertCircle size={17} />
+            ) : (
+              <CheckCircle2 size={17} />
+            )}
             <span>{toast.message}</span>
             {toast.actionLabel ? (
               <button type="button" onClick={toast.onAction}>
@@ -776,6 +1014,7 @@ function MessageList({
   onToggleStar,
   onArchive,
   onTrash,
+  actionsDisabled,
 }: {
   threads: MailThread[];
   activeId: string | null;
@@ -787,6 +1026,7 @@ function MessageList({
   onToggleStar: (thread: MailThread) => void;
   onArchive: (id: string) => void;
   onTrash: (id: string) => void;
+  actionsDisabled: boolean;
 }) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [loadedCount, setLoadedCount] = useState(18);
@@ -859,6 +1099,7 @@ function MessageList({
                 onToggleStar={() => onToggleStar(thread)}
                 onArchive={() => onArchive(thread.id)}
                 onTrash={() => onTrash(thread.id)}
+                actionsDisabled={actionsDisabled}
               />
             </div>
           );
@@ -888,6 +1129,7 @@ function MessageRow({
   onToggleStar,
   onArchive,
   onTrash,
+  actionsDisabled,
 }: {
   thread: MailThread;
   active: boolean;
@@ -897,6 +1139,7 @@ function MessageRow({
   onToggleStar: () => void;
   onArchive: () => void;
   onTrash: () => void;
+  actionsDisabled: boolean;
 }) {
   const [swipe, setSwipe] = useState(0);
   const startX = useRef<number | null>(null);
@@ -920,12 +1163,12 @@ function MessageRow({
   return (
     <div className="swipe-shell">
       <div className="swipe-actions swipe-actions-left">
-        <button type="button" onClick={onArchive}>
+        <button type="button" onClick={onArchive} disabled={actionsDisabled}>
           <Archive size={17} /> Archive
         </button>
       </div>
       <div className="swipe-actions swipe-actions-right">
-        <button type="button" onClick={onTrash}>
+        <button type="button" onClick={onTrash} disabled={actionsDisabled}>
           <Trash2 size={17} /> Trash
         </button>
       </div>
@@ -967,7 +1210,12 @@ function MessageRow({
               {thread.unread ? <i className="unread-dot" /> : null}
               {thread.sender.name}
             </span>
-            <time dateTime="2026-08-18">{thread.receivedAt}</time>
+            <time
+              dateTime={toDateTime(thread.receivedAtFull)}
+              title={thread.receivedAtFull}
+            >
+              {thread.receivedAt}
+            </time>
           </span>
           <span className="message-line-two">
             <strong>{thread.subject}</strong>
@@ -984,6 +1232,7 @@ function MessageRow({
         <button
           type="button"
           className={`row-star ${thread.starred ? "is-starred" : ""}`}
+          disabled={actionsDisabled}
           onClick={(event) => {
             event.stopPropagation();
             onToggleStar();
@@ -1001,6 +1250,9 @@ function ReaderPane({
   thread,
   externalImages,
   onLoadImages,
+  position,
+  total,
+  actionsDisabled,
   onBack,
   onReply,
   onForward,
@@ -1010,13 +1262,19 @@ function ReaderPane({
   thread: MailThread | null;
   externalImages: boolean;
   onLoadImages: () => void;
+  position: number;
+  total: number;
+  actionsDisabled: boolean;
   onBack: () => void;
   onReply: () => void;
   onForward: () => void;
   onArchive: () => void;
   onTrash: () => void;
 }) {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useState<Set<string>>(() => {
+    const latestMessageId = thread?.messages.at(-1)?.id;
+    return latestMessageId ? new Set([latestMessageId]) : new Set();
+  });
 
   if (!thread) {
     return (
@@ -1040,11 +1298,23 @@ function ReaderPane({
           onClick={onBack}
         />
         <div className="reader-toolbar-primary">
-          <IconButton label="Archive message" icon={Archive} onClick={onArchive} />
-          <IconButton label="Move message to Trash" icon={Trash2} onClick={onTrash} />
+          <IconButton
+            label="Archive message"
+            icon={Archive}
+            onClick={onArchive}
+            disabled={actionsDisabled}
+          />
+          <IconButton
+            label="Move message to Trash"
+            icon={Trash2}
+            onClick={onTrash}
+            disabled={actionsDisabled}
+          />
           <IconButton label="More message actions" icon={MoreHorizontal} />
         </div>
-        <div className="reader-position">1 of 18</div>
+        <div className="reader-position">
+          {position > 0 ? `${position} of ${total}` : `${total} conversations`}
+        </div>
       </div>
 
       <div className="reader-scroll">
@@ -1082,7 +1352,7 @@ function ReaderPane({
         <div className="thread-stack">
           {thread.messages.map((message, index) => {
             const current = index === thread.messages.length - 1;
-            const isExpanded = current || expanded.has(message.id);
+            const isExpanded = expanded.has(message.id);
             return (
               <ThreadArticle
                 key={message.id}
@@ -1148,7 +1418,12 @@ function ThreadArticle({
           <small>to me</small>
         </span>
         {!expanded ? <span className="collapsed-preview">Message history</span> : null}
-        <time title={message.sentAtFull}>{message.sentAt}</time>
+        <time
+          dateTime={toDateTime(message.sentAtFull)}
+          title={message.sentAtFull}
+        >
+          {message.sentAt}
+        </time>
         <ChevronRight
           size={16}
           className={expanded ? "chevron-expanded" : ""}
@@ -1205,15 +1480,20 @@ function ComposeDialog({
   activeThread: MailThread | null;
   selectedAccount?: MailAccount;
   onClose: () => void;
-  onSent: () => void;
+  onSent: () => Promise<void>;
 }) {
   const reduceMotion = useReducedMotion();
+  const dialogRef = useRef<HTMLElement>(null);
   const [accountId, setAccountId] = useState(
     selectedAccount?.id ?? accounts[0]?.id ?? "",
   );
+  const resolvedAccountId =
+    accountId || selectedAccount?.id || accounts[0]?.id || "";
   const [recipient, setRecipient] = useState(
     mode === "reply" ? activeThread?.sender.email ?? "" : "",
   );
+  const [cc, setCc] = useState("");
+  const [bcc, setBcc] = useState("");
   const [subject, setSubject] = useState(
     mode === "reply"
       ? `Re: ${activeThread?.subject ?? ""}`
@@ -1224,55 +1504,197 @@ function ComposeDialog({
   const [body, setBody] = useState("");
   const [showCopies, setShowCopies] = useState(false);
   const [sending, setSending] = useState(false);
-  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved">(
-    "idle",
-  );
-  const [attachmentAdded, setAttachmentAdded] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [saveState, setSaveState] = useState<
+    "idle" | "dirty" | "saving" | "saved" | "error"
+  >("idle");
+  const [attachments, setAttachments] = useState<MailAttachment[]>([]);
+  const [composeError, setComposeError] = useState<string | null>(null);
   const [activeFormats, setActiveFormats] = useState<Set<string>>(new Set());
-  const selected = accounts.find((account) => account.id === accountId);
-  const displayedSaveState = selected?.capabilities.reliableDraftUpdates
-    ? saveState
-    : "limited";
+  const draftIdRef = useRef<string | undefined>(undefined);
+  const draftRevisionRef = useRef(0);
+  const lastSavedRevisionRef = useRef(-1);
+  const accountIdRef = useRef(resolvedAccountId);
+  const draftSavePromiseRef = useRef<
+    Promise<{ id: string; savedAt: string }> | null
+  >(null);
+  const selected = accounts.find(
+    (account) => account.id === resolvedAccountId,
+  );
+  const composeLocked = sending || closing;
+  const hasDraftContent = Boolean(
+    recipient || cc || bcc || subject || body || attachments.length,
+  );
 
   useEffect(() => {
+    accountIdRef.current = resolvedAccountId;
+  }, [resolvedAccountId]);
+
+  const markDraftDirty = () => {
+    draftRevisionRef.current += 1;
+    setSaveState("dirty");
+    setComposeError(null);
+  };
+
+  const createDraft = (): MailDraft => ({
+    id: draftIdRef.current,
+    accountId: resolvedAccountId,
+    to: recipient ? [recipient.trim()] : [],
+    cc: splitRecipients(cc),
+    bcc: splitRecipients(bcc),
+    subject,
+    body,
+    attachments,
+  });
+
+  useEffect(() => {
+    if (sending || closing) return;
     if (!selected?.capabilities.reliableDraftUpdates) return;
-    if (!recipient && !subject && !body) return;
-    const timeout = window.setTimeout(async () => {
-      await provider.saveDraft({
-        accountId,
+    if (!hasDraftContent || saveState !== "dirty") return;
+    const revision = draftRevisionRef.current;
+    const timeout = window.setTimeout(() => {
+      const draft: MailDraft = {
+        id: draftIdRef.current,
+        accountId: resolvedAccountId,
         to: recipient ? [recipient] : [],
-        cc: [],
-        bcc: [],
+        cc: splitRecipients(cc),
+        bcc: splitRecipients(bcc),
         subject,
         body,
-        attachments: [],
-      });
-      setSaveState("saved");
+        attachments,
+      };
+
+      void (async () => {
+        setSaveState("saving");
+        setComposeError(null);
+        const previousSave = draftSavePromiseRef.current;
+        const savePromise = (async () => {
+          let previousDraft: { id: string; savedAt: string } | null = null;
+          try {
+            previousDraft = await previousSave;
+          } catch {
+            // A newer snapshot should still be allowed to retry the save.
+          }
+          return provider.saveDraft({
+            ...draft,
+            id: draftIdRef.current ?? previousDraft?.id,
+          });
+        })();
+        draftSavePromiseRef.current = savePromise;
+        try {
+          const savedDraft = await savePromise;
+          draftIdRef.current = savedDraft.id;
+          if (accountIdRef.current === draft.accountId) {
+            lastSavedRevisionRef.current = revision;
+            if (revision === draftRevisionRef.current) setSaveState("saved");
+          }
+        } catch {
+          if (
+            accountIdRef.current === draft.accountId &&
+            revision === draftRevisionRef.current
+          ) {
+            setSaveState("error");
+            setComposeError(
+              "Draft couldn’t be saved automatically. Your text is still here.",
+            );
+          }
+        } finally {
+          if (draftSavePromiseRef.current === savePromise) {
+            draftSavePromiseRef.current = null;
+          }
+        }
+      })();
     }, 700);
     return () => window.clearTimeout(timeout);
-  }, [accountId, body, provider, recipient, selected, subject]);
+  }, [
+    resolvedAccountId,
+    attachments,
+    bcc,
+    body,
+    cc,
+    hasDraftContent,
+    provider,
+    recipient,
+    saveState,
+    selected?.capabilities.reliableDraftUpdates,
+    sending,
+    subject,
+    closing,
+  ]);
+
+  const requestClose = async () => {
+    if (closing || sending) return;
+    if (
+      draftRevisionRef.current === 0 ||
+      !hasDraftContent ||
+      saveState === "saved"
+    ) {
+      onClose();
+      return;
+    }
+
+    setClosing(true);
+    setSaveState("saving");
+    setComposeError(null);
+    try {
+      const currentRevision = draftRevisionRef.current;
+      try {
+        const pendingDraft = await draftSavePromiseRef.current;
+        if (pendingDraft) draftIdRef.current ??= pendingDraft.id;
+      } catch {
+        // Retry below with the latest complete draft snapshot.
+      }
+      if (lastSavedRevisionRef.current !== currentRevision) {
+        const savedDraft = await provider.saveDraft(createDraft());
+        draftIdRef.current = savedDraft.id;
+        lastSavedRevisionRef.current = currentRevision;
+      }
+      setSaveState("saved");
+      onClose();
+    } catch {
+      setSaveState("error");
+      setComposeError(
+        "Draft couldn’t be saved, so the composer stayed open. Please try again.",
+      );
+    } finally {
+      setClosing(false);
+    }
+  };
 
   const sendMessage = async () => {
-    if (!recipient || !subject || sending) return;
+    if (
+      !resolvedAccountId ||
+      !recipient.trim() ||
+      !subject.trim() ||
+      sending ||
+      closing
+    )
+      return;
     setSending(true);
-    const draft: MailDraft = {
-      accountId,
-      to: [recipient],
-      cc: [],
-      bcc: [],
-      subject,
-      body,
-      attachments: [],
-    };
-    if (mode === "reply" && activeThread) {
-      await provider.replyMessage(activeThread.id, draft);
-    } else if (mode === "forward" && activeThread) {
-      await provider.forwardMessage(activeThread.id, draft);
-    } else {
-      await provider.sendMessage(draft);
+    setComposeError(null);
+    try {
+      try {
+        const pendingDraft = await draftSavePromiseRef.current;
+        if (pendingDraft) draftIdRef.current ??= pendingDraft.id;
+      } catch {
+        // Sending can continue with the current text if auto-save failed.
+      }
+      const draft = createDraft();
+      if (mode === "reply" && activeThread) {
+        await provider.replyMessage(activeThread.id, draft);
+      } else if (mode === "forward" && activeThread) {
+        await provider.forwardMessage(activeThread.id, draft);
+      } else {
+        await provider.sendMessage(draft);
+      }
+      await onSent();
+    } catch {
+      setComposeError(
+        "Message couldn’t be sent. Check the recipients and try again.",
+      );
+    } finally {
+      setSending(false);
     }
-    setSending(false);
-    onSent();
   };
 
   const toggleFormat = (format: string) => {
@@ -1292,22 +1714,52 @@ function ComposeDialog({
       exit={{ opacity: 0 }}
       transition={{ duration: reduceMotion ? 0 : 0.18 }}
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) void requestClose();
       }}
     >
       <motion.section
+        ref={dialogRef}
         className="compose-dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby="compose-title"
+        aria-busy={composeLocked}
+        tabIndex={-1}
         initial={reduceMotion ? false : { opacity: 0, y: 12, scale: 0.99 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 8 }}
         transition={{ duration: reduceMotion ? 0 : 0.22 }}
         onKeyDown={(event) => {
-          if (event.key === "Escape") onClose();
+          if (event.key === "Escape") void requestClose();
           if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
             event.preventDefault();
+          }
+          if (event.key === "Tab") {
+            const focusable = Array.from(
+              event.currentTarget.querySelectorAll<HTMLElement>(
+                'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+              ),
+            ).filter((element) => !element.hasAttribute("hidden"));
+            const first = focusable[0];
+            const last = focusable.at(-1);
+            if (!first || !last) {
+              event.preventDefault();
+              event.currentTarget.focus();
+            } else if (
+              event.shiftKey &&
+              (document.activeElement === first ||
+                !event.currentTarget.contains(document.activeElement))
+            ) {
+              event.preventDefault();
+              last.focus();
+            } else if (
+              !event.shiftKey &&
+              (document.activeElement === last ||
+                !event.currentTarget.contains(document.activeElement))
+            ) {
+              event.preventDefault();
+              first.focus();
+            }
           }
         }}
       >
@@ -1319,30 +1771,46 @@ function ComposeDialog({
             </h2>
           </div>
           <div className="draft-state" aria-live="polite">
-            {displayedSaveState === "saving" ? (
+            {saveState === "saving" ? (
               <>
                 <Clock3 size={13} /> Saving…
               </>
-            ) : displayedSaveState === "saved" ? (
+            ) : saveState === "saved" ? (
               <>
                 <Check size={13} /> Saved
               </>
-            ) : displayedSaveState === "limited" ? (
+            ) : saveState === "error" ? (
+              <>
+                <AlertCircle size={13} /> Not saved
+              </>
+            ) : !selected?.capabilities.reliableDraftUpdates ? (
               <>
                 <AlertCircle size={13} /> Save on close
               </>
+            ) : saveState === "dirty" ? (
+              <>
+                <Clock3 size={13} /> Waiting to save…
+              </>
             ) : null}
           </div>
-          <IconButton label="Close compose" icon={X} onClick={onClose} />
+          <IconButton
+            label="Close compose"
+            icon={X}
+            onClick={() => void requestClose()}
+            disabled={closing || sending}
+          />
         </header>
 
         <div className="compose-fields">
           <label className="compose-field">
             <span>From</span>
             <select
-              value={accountId}
+              value={resolvedAccountId}
+              disabled={composeLocked}
               onChange={(event) => {
-                setSaveState("saving");
+                accountIdRef.current = event.target.value;
+                lastSavedRevisionRef.current = -1;
+                markDraftDirty();
                 setAccountId(event.target.value);
               }}
             >
@@ -1359,13 +1827,18 @@ function ComposeDialog({
               autoFocus
               type="email"
               value={recipient}
+              disabled={composeLocked}
               onChange={(event) => {
-                setSaveState("saving");
+                markDraftDirty();
                 setRecipient(event.target.value);
               }}
               placeholder="name@example.test"
             />
-            <button type="button" onClick={() => setShowCopies((show) => !show)}>
+            <button
+              type="button"
+              disabled={composeLocked}
+              onClick={() => setShowCopies((show) => !show)}
+            >
               Cc / Bcc
             </button>
           </label>
@@ -1373,11 +1846,31 @@ function ComposeDialog({
             <>
               <label className="compose-field">
                 <span>Cc</span>
-                <input type="email" aria-label="Carbon copy recipients" />
+                <input
+                  type="text"
+                  value={cc}
+                  disabled={composeLocked}
+                  onChange={(event) => {
+                    markDraftDirty();
+                    setCc(event.target.value);
+                  }}
+                  aria-label="Carbon copy recipients"
+                  placeholder="Separate addresses with commas"
+                />
               </label>
               <label className="compose-field">
                 <span>Bcc</span>
-                <input type="email" aria-label="Blind carbon copy recipients" />
+                <input
+                  type="text"
+                  value={bcc}
+                  disabled={composeLocked}
+                  onChange={(event) => {
+                    markDraftDirty();
+                    setBcc(event.target.value);
+                  }}
+                  aria-label="Blind carbon copy recipients"
+                  placeholder="Separate addresses with commas"
+                />
               </label>
             </>
           ) : null}
@@ -1385,8 +1878,9 @@ function ComposeDialog({
             <span>Subject</span>
             <input
               value={subject}
+              disabled={composeLocked}
               onChange={(event) => {
-                setSaveState("saving");
+                markDraftDirty();
                 setSubject(event.target.value);
               }}
               placeholder="A clear subject"
@@ -1406,6 +1900,7 @@ function ComposeDialog({
             <button
               key={id as string}
               type="button"
+              disabled={composeLocked}
               className={activeFormats.has(id as string) ? "is-active" : ""}
               onClick={() => toggleFormat(id as string)}
               aria-label={label as string}
@@ -1420,28 +1915,41 @@ function ComposeDialog({
           <span className="sr-only">Message body</span>
           <textarea
             value={body}
+            disabled={composeLocked}
             onChange={(event) => {
-              setSaveState("saving");
+              markDraftDirty();
               setBody(event.target.value);
             }}
             placeholder="Write a message…"
           />
         </label>
 
-        {attachmentAdded ? (
-          <div className="compose-attachment">
+        {attachments.map((attachment) => (
+          <div className="compose-attachment" key={attachment.id}>
             <FileText size={18} />
             <span>
-              <strong>project-note.pdf</strong>
-              <small>248 KB · ready</small>
+              <strong>{attachment.name}</strong>
+              <small>{attachment.size} · ready</small>
             </span>
             <button
               type="button"
-              onClick={() => setAttachmentAdded(false)}
-              aria-label="Remove project-note.pdf"
+              disabled={composeLocked}
+              onClick={() => {
+                markDraftDirty();
+                setAttachments((current) =>
+                  current.filter((item) => item.id !== attachment.id),
+                );
+              }}
+              aria-label={`Remove ${attachment.name}`}
             >
               <X size={15} />
             </button>
+          </div>
+        ))}
+
+        {composeError ? (
+          <div className="compose-error" role="alert">
+            <AlertCircle size={15} /> {composeError}
           </div>
         ) : null}
 
@@ -1450,7 +1958,12 @@ function ComposeDialog({
             <button
               type="button"
               className="send-button"
-              disabled={!recipient || !subject || sending}
+              disabled={
+                !resolvedAccountId ||
+                !recipient.trim() ||
+                !subject.trim() ||
+                composeLocked
+              }
               onClick={sendMessage}
             >
               <Send size={16} /> {sending ? "Sending…" : "Send"}
@@ -1458,7 +1971,18 @@ function ComposeDialog({
             <button
               type="button"
               className="attach-button"
-              onClick={() => setAttachmentAdded(true)}
+              disabled={attachments.length > 0 || sending || closing}
+              onClick={() => {
+                markDraftDirty();
+                setAttachments([
+                  {
+                    id: "compose-project-note",
+                    name: "project-note.pdf",
+                    size: "248 KB",
+                    kind: "document",
+                  },
+                ]);
+              }}
             >
               <Paperclip size={17} />
               <span className="sr-only">Attach file</span>
@@ -1836,17 +2360,20 @@ function IconButton({
   icon: Icon,
   onClick,
   className = "",
+  disabled = false,
 }: {
   label: string;
   icon: LucideIcon;
   onClick?: () => void;
   className?: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       className={`icon-button ${className}`}
       onClick={onClick}
+      disabled={disabled}
       aria-label={label}
       title={label}
     >
