@@ -17,7 +17,7 @@ before(async () => {
     resolve: {
       alias: { "@": projectRoot },
     },
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
   });
   ({ MockMailProvider } = await vite.ssrLoadModule(
     "/src/providers/mail/MockMailProvider.ts",

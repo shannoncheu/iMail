@@ -10,11 +10,14 @@
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite",
     "build": "bash scripts/build-verified.sh",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/mock-mail-provider.test.mjs",
+    "test": "npm run build && node --test --test-concurrency=1 tests/rendered-html.test.mjs tests/mock-mail-provider.test.mjs tests/auth-security.test.mjs tests/auth-flow.test.mjs tests/auth-repository.test.mjs tests/server-provider-boundary.test.mjs",
+    "db:migrate": "node --env-file-if-exists=.dev.vars scripts/migrate.mjs",
+    "typecheck": "tsc --noEmit",
     "validate:artifact": "bash scripts/validate-artifact.sh",
     "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "@tanstack/react-query": "^5.101.4",
     "@tanstack/react-virtual": "^3.14.9",
     "lucide-react": "^1.31.0",
@@ -22,6 +25,7 @@
     "next": "16.2.6",
     "react": "19.2.6",
     "react-dom": "19.2.6",
+    "server-only": "^0.0.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
